@@ -33,7 +33,9 @@ extern "C" {
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
+#include <unordered_map>
 
 // ---------------------------------------------------------------------------
 // quant / dequant helpers (symmetric per-vector int8, scale = maxabs/127)
@@ -71,6 +73,75 @@ static void dequant_q8_0(const uint8_t * w, int K, int N, float * out) {
 }
 
 // ---------------------------------------------------------------------------
+// WEIGHT CACHE (Stage 5)
+//   A 4B model's weight matrices are tens of MB each. Shipping them over
+//   FastRPC on every token is what made the naive path unusable. Instead we
+//   upload + prepack each unique weight ONCE on the DSP and keep a handle;
+//   every subsequent MUL_MAT only ships the small activation A.
+//
+//   The cache is keyed by the weight tensor's data pointer + its in-tensor
+//   batch index. It is an LRU with a byte capacity (default 256 MB, tunable via
+//   GGML_CDSP_CACHE_MB) so we never try to hold the entire model on the cDSP
+//   (which cannot fit a 4B model as int8). On eviction we release the DSP
+//   handle (freeing its prepacked buffer).
+// ---------------------------------------------------------------------------
+struct CachedWeight {
+    int32_t            handle;
+    int                N, K;
+    std::vector<float> sB;          // per-column weight scales (N)
+    size_t             packed_bytes; // DSP-side prepacked size (capacity acct)
+    long long          last;         // LRU timestamp
+};
+
+struct WKey {
+    const void * p;
+    int64_t      b1;
+    bool operator==(const WKey & o) const { return p == o.p && b1 == o.b1; }
+};
+struct WKeyHash {
+    size_t operator()(const WKey & k) const {
+        return std::hash<const void*>()(k.p) ^ (std::hash<int64_t>()(k.b1) << 1);
+    }
+};
+
+static std::unordered_map<WKey, CachedWeight, WKeyHash> g_wcache;
+static size_t   g_wcache_bytes = 0;
+static long long g_wcache_tick = 0;
+static size_t   g_wcache_cap   = 256ULL * 1024 * 1024;  // tunable via env
+static int      g_wcache_hits  = 0;
+static int      g_wcache_misses = 0;
+
+static void wcache_init_cap(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char * e = getenv("GGML_CDSP_CACHE_MB");
+    if (e) { long long mb = atoll(e); if (mb > 0) g_wcache_cap = (size_t)mb * 1024 * 1024; }
+}
+
+static void wcache_evict_to_fit(size_t incoming) {
+    // Evict least-recently-used entries until it fits. The entry we are about
+    // to use always has the newest `last`, so it is never chosen.
+    while (!g_wcache.empty() &&
+           g_wcache_bytes + incoming > g_wcache_cap &&
+           g_wcache.size() > 1) {
+        auto mit = g_wcache.begin();
+        for (auto it = g_wcache.begin(); it != g_wcache.end(); ++it)
+            if (it->second.last < mit->second.last) mit = it;
+        cdsp_gemm_release(mit->second.handle);
+        g_wcache_bytes -= mit->second.packed_bytes;
+        g_wcache.erase(mit);
+    }
+}
+
+static void wcache_release_all(void) {
+    for (auto & kv : g_wcache) cdsp_gemm_release(kv.second.handle);
+    g_wcache.clear();
+    g_wcache_bytes = 0;
+    g_wcache_hits = g_wcache_misses = 0;
+}
+
+// ---------------------------------------------------------------------------
 // the actual MUL_MAT compute, dispatched to the cDSP
 // ---------------------------------------------------------------------------
 static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
@@ -100,12 +171,9 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
     const size_t wbatch = ggml_nbytes(src1) / (size_t)(B1 > 0 ? B1 : 1);
 
     std::vector<int8_t>  Aq((size_t)M * K);
-    std::vector<int8_t>  Bq((size_t)N * K);
-    std::vector<int8_t>  Bt((size_t)K * N);
     std::vector<float>   sA((size_t)M);
-    std::vector<float>   sB((size_t)N);
-    std::vector<float>   Bf((size_t)N * K);
-    std::vector<int32_t> C32((size_t)M * N);
+
+    wcache_init_cap();
 
     for (int64_t b = 0; b < B0; b++) {
         int64_t b1 = (B1 == 1) ? 0 : b;
@@ -113,40 +181,74 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
         const uint8_t * Wb  = W  + b1 * wbatch;
         float         * Cb  = C  + b * M * N;
 
-        // 1. quantize activation A (M x K) per row
+        // ---- weight cache lookup (keyed by pointer + in-tensor batch) ----
+        WKey key{ (const void *)Wb, b1 };
+        auto it = g_wcache.find(key);
+        if (it == g_wcache.end()) {
+            g_wcache_misses++;
+            // 1. weight Wb (N x K) -> F32 (dequant Q8_0 if needed)
+            std::vector<float> Bf((size_t)N * K);
+            if (src1->type == GGML_TYPE_F32) {
+                memcpy(Bf.data(), Wb, (size_t)N * K * sizeof(float));
+            } else {
+                dequant_q8_0(Wb, (int)K, (int)N, Bf.data());
+            }
+            // 2. quantize weight per column -> Bq (N x K) + sB (N scales)
+            std::vector<int8_t>  Bq((size_t)N * K);
+            std::vector<float>   sB((size_t)N);
+            for (int64_t n = 0; n < N; n++)
+                quant_vec(Bf.data() + n * K, (int)K, Bq.data() + n * K, &sB[n]);
+            // 3. transpose Bq (N x K) -> Bt (K x N): Bt[k][n] = Bq[n][k]
+            std::vector<int8_t> Bt((size_t)K * N);
+            for (int64_t n = 0; n < N; n++)
+                for (int64_t k = 0; k < K; k++)
+                    Bt[(size_t)k * N + n] = Bq[(size_t)n * K + k];
+            // 4. upload + prepack on DSP -> handle (sent over FastRPC ONCE)
+            int32_t handle;
+            int rc = cdsp_gemm_upload(Bt.data(), (int)K, (int)N, &handle);
+            if (rc != 0) {
+                fprintf(stderr, "ggml-cdsp: DSP weight upload failed rc=%d\n", rc);
+                return GGML_STATUS_FAILED;
+            }
+            const int Kblk = (K + 3) / 4, nT = (N + 31) / 32;
+            size_t packed = (size_t)nT * Kblk * 128;
+            CachedWeight entry{ handle, (int)N, (int)K, std::move(sB), packed, ++g_wcache_tick };
+            wcache_evict_to_fit(packed);
+            g_wcache[key] = std::move(entry);
+            g_wcache_bytes += packed;
+            it = g_wcache.find(key);
+        } else {
+            g_wcache_hits++;
+        }
+        it->second.last = ++g_wcache_tick;
+        const CachedWeight & cw = it->second;
+
+        // 5. quantize activation A (M x K) per row
         for (int64_t m = 0; m < M; m++)
             quant_vec(Ab + m * K, (int)K, Aq.data() + m * K, &sA[m]);
 
-        // 2. weight B -> F32 (N x K)
-        if (src1->type == GGML_TYPE_F32) {
-            memcpy(Bf.data(), Wb, (size_t)N * K * sizeof(float));
-        } else {
-            dequant_q8_0(Wb, (int)K, (int)N, Bf.data());
-        }
-
-        // 3. quantize weight Bf (N x K) per column
-        for (int64_t n = 0; n < N; n++)
-            quant_vec(Bf.data() + n * K, (int)K, Bq.data() + n * K, &sB[n]);
-
-        // 4. transpose Bq (N x K) -> Bt (K x N): Bt[k][n] = Bq[n][k]
-        for (int64_t n = 0; n < N; n++)
-            for (int64_t k = 0; k < K; k++)
-                Bt[(size_t)k * N + n] = Bq[(size_t)n * K + k];
-
-        // 5. DSP int8 GEMM: C32 (M x N) = Aq (M x K) @ Bt (K x N)
-        int rc = cdsp_gemm_compute(Aq.data(), (int)M, (int)K,
-                                   Bt.data(), (int)N, C32.data());
+        // 6. DSP int8 GEMM via cached weight: C32 = Aq @ cached B (only A sent)
+        std::vector<int32_t> C32((size_t)M * N);
+        int rc = cdsp_gemm_compute_cached(Aq.data(), (int)M, (int)K, (int)N,
+                                          cw.handle, C32.data());
         if (rc != 0) {
-            fprintf(stderr, "ggml-cdsp: DSP GEMM failed rc=%d\n", rc);
+            fprintf(stderr, "ggml-cdsp: DSP cached GEMM failed rc=%d\n", rc);
             return GGML_STATUS_FAILED;
         }
 
-        // 6. recover F32: C[m][n] = sA[m] * sB[n] * C32[m][n]
+        // 7. recover F32: C[m][n] = sA[m] * sB[n] * C32[m][n]
         for (int64_t m = 0; m < M; m++)
             for (int64_t n = 0; n < N; n++)
                 Cb[(size_t)m * N + n] =
-                    sA[m] * sB[n] * (float)C32[(size_t)m * N + n];
+                    sA[m] * cw.sB[n] * (float)C32[(size_t)m * N + n];
     }
+
+    if (getenv("GGML_CDSP_DEBUG"))
+        fprintf(stderr, "[ggml-cdsp] MUL_MAT M=%lld N=%lld K=%lld "
+                "cache hits=%d misses=%d bytes=%zu\n",
+                (long long)M, (long long)N, (long long)K,
+                g_wcache_hits, g_wcache_misses, g_wcache_bytes);
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -156,6 +258,7 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
 static const char * cdsp_backend_get_name(ggml_backend_t) { return "cdsp"; }
 
 static void cdsp_backend_free(ggml_backend_t backend) {
+    wcache_release_all();   // release all cached DSP weight handles
     delete backend;
 }
 

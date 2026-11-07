@@ -62,6 +62,9 @@ __QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_open)(const char* uri, remote_h
 __QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_close)(remote_handle64 h) __QAIC_HEADER_ATTRIBUTE;
 __QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_rpc_init)(remote_handle64 _h) __QAIC_HEADER_ATTRIBUTE;
 __QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_gemm_int8)(remote_handle64 _h, const int8* A, int ALen, const int8* B, int BLen, const int32* dims, int dimsLen, int32* C, int CLen) __QAIC_HEADER_ATTRIBUTE;
+__QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_gemm_upload)(remote_handle64 _h, const int8* B, int BLen, const int32* dims, int dimsLen, int32* handle) __QAIC_HEADER_ATTRIBUTE;
+__QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_gemm_compute_cached)(remote_handle64 _h, const int8* A, int ALen, const int32* dims, int dimsLen, int32 handle, int32* C, int CLen) __QAIC_HEADER_ATTRIBUTE;
+__QAIC_HEADER_EXPORT int __QAIC_HEADER(cdsp_gemm_gemm_release)(remote_handle64 _h, int32 handle) __QAIC_HEADER_ATTRIBUTE;
 #ifndef cdsp_gemm_URI
 #define cdsp_gemm_URI "file:///libgemm_skel.so?cdsp_gemm_skel_handle_invoke&_modver=1.0"
 #endif /*cdsp_gemm_URI*/

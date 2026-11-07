@@ -37,6 +37,12 @@ static int cdsp_gemm_rpc_init(remote_handle64) { return -1; }
 static int cdsp_gemm_gemm_int8(remote_handle64, const int8_t *, int,
                                const int8_t *, int, const int32_t *, int,
                                int32_t *, int) { return -1; }
+static int cdsp_gemm_gemm_upload(remote_handle64, const int8_t *, int,
+                                 const int32_t *, int, int32_t *) { return -1; }
+static int cdsp_gemm_gemm_compute_cached(remote_handle64, const int8_t *, int,
+                                         const int32_t *, int, int32_t,
+                                         int32_t *, int) { return -1; }
+static int cdsp_gemm_gemm_release(remote_handle64, int32_t) { return -1; }
 #define CDSP_FULL_URI "file:///libgemm_skel.so?cdsp_gemm_skel_handle_invoke&_modver=1.0&_dom=cdsp"
 #endif
 
@@ -71,4 +77,35 @@ int cdsp_gemm_compute(const int8_t * A, int M, int K,
         B, (int)((size_t)K * N),
         dims, 3,
         C, (int)((size_t)M * N));
+}
+
+// ---- WEIGHT-CACHE API ------------------------------------------------------
+int cdsp_gemm_upload(const int8_t * Bt, int K, int N, int32_t * handle_out) {
+    int rc = ensure_session();
+    if (rc != 0) return rc;
+
+    int32_t dims[3] = { 0, N, K };   // M ignored on upload; N,K drive prepack
+    int32_t h = -1;
+    rc = cdsp_gemm_gemm_upload(g_h, Bt, (int)((size_t)K * N), dims, 3, &h);
+    if (rc != 0) return rc;
+    *handle_out = h;
+    return 0;
+}
+
+int cdsp_gemm_compute_cached(const int8_t * A, int M, int K, int N,
+                             int32_t handle, int32_t * C) {
+    int rc = ensure_session();
+    if (rc != 0) return rc;
+
+    int32_t dims[3] = { M, N, K };
+    return cdsp_gemm_gemm_compute_cached(
+        g_h,
+        A, (int)((size_t)M * K),
+        dims, 3, handle,
+        C, (int)((size_t)M * N));
+}
+
+int cdsp_gemm_release(int32_t handle) {
+    if (!g_open) return 0;
+    return cdsp_gemm_gemm_release(g_h, handle);
 }

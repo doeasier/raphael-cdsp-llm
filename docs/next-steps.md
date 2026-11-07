@@ -1,48 +1,42 @@
 # Next steps — making cDSP inference actually useful
 
-Stages 0–2.5 prove the **correctness and integration path**. They do **not** yet
-make real llama.cpp inference viable, because of one structural bottleneck and one
-performance gap. This document defines the roadmap.
+Stages 0–5 are now implemented and verified on the device (correctness + the
+weight-cache transport fix). This document defines what remains before real
+llama.cpp inference is genuinely useful.
 
 ---
 
-## 1. The hard blocker: weight re-shipping on every call
+## 1. Weight-cache RPC — DONE (Stage 5)
 
-Today the backend (in `ggml-cdsp.cpp` → `cdsp_gemm_compute`) ships **both** A and
-B to the DSP on every `MUL_MAT`. For a real model that means re-transmitting the
-entire weight matrix (tens of MB per layer) over FastRPC **on every token** during
-decode. Measured impact at real model dimensions:
+The structural blocker is solved. The backend now uploads each weight tensor to
+the DSP **once** (`gemm_upload`) and reuses it across tokens
+(`gemm_compute_cached`), keyed by an LRU cache (`GGML_CDSP_CACHE_MB`, default 256
+MB). Measured at real model dimensions:
 
-| Scenario | M×N×K | Round-trip time |
-|---|---|---|
-| decode attention | 1×4096×4096 | 281 ms |
-| decode FFN | 1×11008×4096 | 762 ms |
-| prefill attention | 32×4096×4096 | 691 ms |
+| Scenario | M×N×K | Naive (re-ship B) | **Cached (ship A only)** | Upload (1×) |
+|---|---|---|---|---|
+| decode attention | 1×4096×4096 | 281 ms | **14 ms** | 253 ms |
+| decode FFN | 1×11008×4096 | 762 ms | **37 ms** | 672 ms |
 
-Effective compute is only ~1–4 GMAC/s — far below the HVX ceiling (see §2) — and
-decode is dominated by re-shipping weights, not by the matmul itself. This is
-fundamentally unusable for token generation.
+The 253/672 ms upload is a one-time, per-weight cost. After it, the per-token cost
+is dominated by the matmul itself.
 
-### Fix: weight-cache RPC (the next milestone)
+### 1.1 Remaining caveat: cDSP memory capacity
 
-Add FastRPC methods so weights are uploaded **once** and subsequent calls only ship
-the small activation matrix A:
+The cache holds the model as **int8** on the DSP. A 4B model is ~4 GB int8 — far
+more than the cDSP can hold — so the 256 MB default cache will **thrash** for such
+models (least-recently-used weights get released and re-uploaded within a token).
+This means:
 
-1. `gemm_upload(B_int8, dims)` — quantize + prepack B on the AP, upload to the DSP,
-   store the prepacked buffer + dimensions in a **session-scoped handle**
-   (`remote_handle64` or a slot table inside the skel).
-2. `gemm_compute_cached(A_int8, B_handle, dims)` — only A is marshaled; the skel
-   reuses the already-prepacked B and runs the same HVX kernel.
-3. `gemm_release(B_handle)` — free the cached buffer.
+- **Small models** (that fit as int8 in DSP RAM, or fit in the cache) get the full
+  win and become genuinely interactive.
+- **Large models (e.g. Qwen3.5-4B)** need either (a) more DSP RAM, (b) a smarter
+  staging scheme (keep packed weights on the AP and stream tiles — still a transport
+  cost, but amortized per-tile, not per-layer), or (c) accept per-layer eviction
+  and measure the real token/s. This is the next real research problem.
 
-On the ggml side, the plugin must cache the quantized+prepacked weight per
-`src1` tensor (keyed by tensor pointer / an opaque id) so the upload happens once
-per weight tensor (i.e. once per model load), not per `MUL_MAT` invocation. The
-currently-correct `cdsp_gemm_compute(A,B,...)` path can remain as a fallback.
-
-**Expected win:** decode cost drops from "ship weights every time" to "ship a
-1×K activation" → from hundreds of ms to single-digit ms per MUL_MAT at these
-sizes, making small models (and prefill) genuinely interactive.
+The repo's `Qwen3.5-4B-Q4_K_M.gguf` is already on the device at `/data2/model/`
+(see §3 to actually run it and measure).
 
 ---
 
@@ -94,12 +88,13 @@ cDSP, then measure tokens/s vs the pure-CPU path. Compare against the CPU baseli
 
 ## 4. Suggested task order
 
-1. **Weight-cache RPC** (`gemm_upload` / `gemm_compute_cached` / `gemm_release` in
-   `gemm.idl` + `gemm_dsp.c`; cache handle in the plugin). *Highest leverage.*
-2. Re-run Stages 1–2.5 with the cached path; add a decode-loop benchmark
-   (`host_test 1 <N> <K>` many times) to measure steady-state token cost.
-3. HVX peak tuning from §2 (prepack-out-of-hot-path is already solved by step 1).
-4. Real `llama.cpp` inference test (§3); publish tokens/s CPU-vs-cDSP numbers.
+1. **HVX peak tuning** (§2) — now the dominant lever; the prepack is already out of
+   the hot path thanks to Stage 5. Close the ~4 → ~150 GMAC/s gap.
+2. Run the **real llama.cpp** inference test (§3) with `Qwen3.5-4B` and measure
+   tokens/s CPU-vs-cDSP (start with a small `GGML_CDSP_CACHE_MB` to see the thrash
+   behavior, then a large one if DSP RAM allows).
+3. If large-model thrash is unacceptable, design the smarter staging scheme (§1.1),
+   e.g. keep packed weights on the AP and stream tiles.
 
 ---
 
@@ -110,5 +105,8 @@ cDSP, then measure tokens/s vs the pure-CPU path. Compare against the CPU baseli
 - Quantization is symmetric per-vector int8 (scale = maxabs/127). No per-block
   grouping. Accuracy is fine for a PoC but not optimal; it mirrors the reference
   path used for verification.
-- The scheduler integration test (`test_sched.cpp`) proves the offload path with a
-  tiny graph; it is not a substitute for the full `llama.cpp` inference test in §3.
+- The weight cache holds the model as int8 on the DSP; models larger than the cache
+  (and larger than DSP RAM) thrash (§1.1). Small models are fully covered.
+- The scheduler integration test (`test_sched.cpp`) and cache test (`test_cache.cpp`)
+  prove the offload/cache path with a tiny graph; they are not a substitute for the
+  full `llama.cpp` inference test in §3.

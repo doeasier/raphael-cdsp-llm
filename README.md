@@ -20,6 +20,7 @@ eXtensions).
 | 1 | Deploy + run `host_test` on the phone (correctness + timing) | `PASS` at 3 sizes, ~16× faster than scalar |
 | 2 | Build the `ggml` backend plugin (`libggml-cdsp.so`) + run `test_cdsp` | `PASS` — cDSP computes `MUL_MAT` correctly |
 | 2.5 | Run `test_sched` (scheduler integration) | `SCHED_TEST PASS` — `MUL_MAT→cDSP`, `relu→CPU` |
+| 5 | Weight-cache RPC: upload weights once, reuse handle | `test_cache` `CACHE_TEST PASS`; decode 1×11008×4096 drops 762 ms → **37 ms/token** |
 
 **Measured results (K20 Pro cDSP, HVX):**
 
@@ -29,12 +30,22 @@ eXtensions).
 | 64×256×256   | 21.97 ms | 2.06 ms  | 10.7× |
 | 128×512×512  | 130.84 ms | 7.92 ms | **16.5×** |
 
+**Stage 5 — the weight-cache win (decode no longer re-ships weights):**
+
+| Scenario | M×N×K | Naive (re-ship B) | **Cached (ship A only)** | Upload (1×) |
+|---|---|---|---|---|
+| decode attention | 1×4096×4096 | 281 ms | **14 ms** | 253 ms |
+| decode FFN | 1×11008×4096 | 762 ms | **37 ms** | 672 ms |
+
 Real model-layer dimensions also pass bit-exact
 (`host_test 1 4096 4096` → `PASS`, `host_test 1 11008 4096` → `PASS`,
 `host_test 32 4096 4096` → `PASS`).
 
-See [docs/next-steps.md](docs/next-steps.md) for the remaining work to make
-*end-to-end* llama.cpp inference actually useful (weight-caching + HVX peak tuning).
+> The 253/672 ms "Upload" is a **one-time, per-weight** cost (amortized across all
+> subsequent tokens). The remaining per-token cost is dominated by the matmul
+> itself — so the structural transport blocker is solved. See
+> [docs/next-steps.md](docs/next-steps.md) for the remaining HVX-peak tuning and
+> the cDSP-memory capacity caveat for very large models.
 
 ---
 
@@ -47,7 +58,7 @@ flowchart TB
         SCHED["ggml backend scheduler"]
         CPU["CPU backend<br/>(all ops except MUL_MAT)"]
         CDSP["cDSP backend<br/>libggml-cdsp.so  (this repo)"]
-        HOST["cdsp_gemm_host.cpp<br/>quant A per-row, B per-col;<br/>transpose B"]
+        HOST["cdsp_gemm_host.cpp<br/>LRU weight cache;<br/>quant A per-row, B per-col;<br/>transpose B on upload"]
         RPC["libadsprpc / FastRPC"]
         APP --> SCHED
         SCHED -->|MUL_MAT| CDSP
@@ -55,25 +66,31 @@ flowchart TB
         CDSP --> HOST --> RPC
     end
     subgraph DSP["cDSP — Hexagon 690 / V66 (128-byte HVX)"]
-        SKEL["libgemm_skel.so  (this repo)<br/>HVX vrmpy int8 GEMM"]
+        SKEL["libgemm_skel.so  (this repo)<br/>HVX vrmpy int8 GEMM<br/>+ weight-cache table"]
     end
-    RPC -->|"gemm_int8(Aq, Bt, dims)"| SKEL
+    RPC -->|"gemm_upload(Bt)  [once]"| SKEL
+    RPC -->|"gemm_compute_cached(A, handle)"| SKEL
     SKEL -->|"C = A·B (int32)"| RPC
 ```
 
-**Per-`MUL_MAT` data flow:**
+**Per-`MUL_MAT` data flow (with weight cache):**
 
 ```mermaid
 sequenceDiagram
     participant S as Scheduler
     participant B as cDSP backend (plugin)
     participant D as cDSP skel (HVX)
+    Note over B,D: FIRST time a weight is seen (cache miss)
     S->>B: dispatch MUL_MAT node
-    B->>B: quant activation A rows -> int8 (scale sA)
     B->>B: dequant weight -> float, quant cols -> int8 (scale sB)
     B->>B: transpose B (K×N -> N×K)
-    B->>D: FastRPC gemm_int8(Aq, Bt, dims)
-    D->>D: HVX vrmpy: C32 = Aq · Bt (int32)
+    B->>D: FastRPC gemm_upload(Bt)  [one-time]
+    D->>D: prepack Bt into tile layout, store under handle
+    Note over B,D: EVERY token (cache hit)
+    S->>B: dispatch MUL_MAT (same weight)
+    B->>B: quant activation A rows -> int8 (scale sA)  [only A shipped]
+    B->>D: FastRPC gemm_compute_cached(Aq, handle)
+    D->>D: HVX vrmpy: C32 = Aq · cachedB (int32)
     D-->>B: C32 (M×N, int32)
     B->>B: C = sA · sB · C32 -> float
     B-->>S: F32 result tensor
@@ -88,7 +105,8 @@ flowchart LR
     A0["Stage 0<br/>build_win.sh<br/>-> prebuilt/libgemm_skel.so"] --> A1
     A1["Stage 1<br/>deploy_cdsp_gemm.py<br/>install skel + host_test<br/>PASS"] --> A2
     A2["Stage 2<br/>deploy_ggml_cdsp.py<br/>libggml-cdsp.so + test_cdsp<br/>PASS"] --> A25
-    A25["Stage 2.5<br/>test_sched<br/>scheduler offload<br/>SCHED_TEST PASS"] --> NX["Next:<br/>weight-cache RPC<br/>+ HVX peak tuning"]
+    A25["Stage 2.5<br/>test_sched<br/>scheduler offload<br/>SCHED_TEST PASS"] --> A5
+    A5["Stage 5<br/>weight-cache RPC<br/>upload once, reuse handle<br/>CACHE_TEST PASS"] --> NX["Next:<br/>HVX peak tuning<br/>+ real llama.cpp inference"]
 ```
 
 See [docs/reproduce.md](docs/reproduce.md) for the exact commands.
@@ -110,14 +128,16 @@ raphael-cdsp-llm/
 │   │   ├── build_win.sh      #   Hexagon SDK build -> prebuilt/libgemm_skel.so
 │   │   └── AEEStdDef.h, AEEStdErr.h
 │   ├── host/                 # Stage 1: AP-side correctness + perf test
-│   │   └── host_test.c       #   random int8 GEMM -> verify + time
-│   ├── ggml-backend/         # Stage 2/2.5: ggml backend plugin
-│   │   ├── ggml-cdsp.cpp     #   backend registration + MUL_MAT compute
-│   │   ├── cdsp_gemm_host.{h,cpp}  # FastRPC session wrapper
+│   │   ├── host_test.c       #   one-shot int8 GEMM -> verify + time
+│   │   └── host_test_cached.c#   weight-cache API test (upload/compute/release)
+│   ├── ggml-backend/         # Stage 2/2.5/5: ggml backend plugin
+│   │   ├── ggml-cdsp.cpp     #   backend registration + MUL_MAT compute + LRU weight cache
+│   │   ├── cdsp_gemm_host.{h,cpp}  # FastRPC session wrapper (+ cache API)
 │   │   ├── ggml-backend-impl.h      # ABI pin (copied from ggml 0.9.0)
 │   │   ├── build_device.sh   # on-device build -> libggml-cdsp.so
 │   │   ├── test_cdsp.cpp     # single-backend correctness test
-│   │   └── test_sched.cpp    # scheduler integration test
+│   │   ├── test_sched.cpp    # scheduler integration test
+│   │   └── test_cache.cpp    # scheduler-level weight-cache reuse test
 │   └── gen/                  # QAIC-generated (committed; SDK optional)
 │       ├── gemm.h
 │       ├── cdsp_gemm_skel.c  #   DSP-side dispatch
@@ -128,8 +148,8 @@ raphael-cdsp-llm/
 │   └── ggml-0.9.0-headers/   # ggml public headers (build dependency)
 ├── scripts/device/
 │   ├── k20_ssh.py            # USB-NCM SSH/SFTP helper (root@172.16.42.1)
-│   ├── deploy_cdsp_gemm.py   # Stage 1 deploy + test
-│   └── deploy_ggml_cdsp.py   # Stage 2/2.5 deploy + tests
+│   ├── deploy_cdsp_gemm.py   # Stage 1 + Stage 5 (cached) deploy + tests
+│   └── deploy_ggml_cdsp.py   # Stage 2/2.5/5 deploy + tests
 └── docs/
     ├── architecture.md        # detailed architecture + HVX kernel notes
     ├── reproduce.md           # step-by-step reproduction
@@ -176,16 +196,19 @@ cd raphael-cdsp-llm
 # Requires Qualcomm Hexagon SDK 4.3.0.0 on Windows:
 cd src/dsp && bash build_win.sh && cd ../..
 
-# Stage 1 — install the skel on the phone and verify the GEMM kernel
+# Stage 1 + Stage 5 — install the skel on the phone and verify the GEMM kernel
+# (the script also runs the weight-cache test: upload once, then compute_cached)
 python3 scripts/device/deploy_cdsp_gemm.py
 #   -> host: PASS - all 4096 elements verified correct.
+#   -> host_test_cached: PASS  (decode 1x11008x4096: 672 ms upload, 37 ms/token)
 
-# Stage 2 + 2.5 — build the ggml backend, run both tests on the phone
+# Stage 2 + 2.5 + 5 — build the ggml backend, run all three tests on the phone
 python3 scripts/device/deploy_ggml_cdsp.py
 #   -> OK: loaded backend 'cdsp'
 #   -> PASS
 #   -> SCHED_TEST PASS
-#   -> "CONFIRMED: scheduler offloaded MUL_MAT to the cDSP backend."
+#   -> CACHE_TEST PASS
+#   -> "CONFIRMED: cached weights reused across computes (no re-upload)."
 ```
 
 That is the whole proof. For the full walkthrough (env setup, expected log

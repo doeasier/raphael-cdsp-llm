@@ -7,10 +7,30 @@
 // returns C (MxN, int32). Per-row / per-tensor rescaling to float is done on
 // the host side (llama.cpp already carries the scales).
 //
+// Two dispatch modes are provided:
+//   * gemm_int8          - one-shot GEMM (A and B sent together). Kept for the
+//                          standalone Stage-1 correctness test and as a
+//                          fallback path.
+//   * gemm_upload + gemm_compute_cached + gemm_release
+//                        - the WEIGHT-CACHE API. The (large) weight matrix B is
+//                          uploaded + prepacked on the DSP ONCE and stored under
+//                          a handle; every subsequent decode step only ships the
+//                          (small) activation A. This is what makes real
+//                          token-by-token inference feasible: a 4B-model decode
+//                          step no longer re-transmits tens of MB of weights
+//                          over FastRPC on every single token.
+//
 // QAIC method naming: interface X : remote_handle64 { long foo(...); }
 //   -> cdsp_gemm_foo(remote_handle64 _h, ...)
 //   -> cdsp_gemm_open / cdsp_gemm_close
 //   -> pointers go through rpcmem shared memory automatically.
+//
+// Layout convention (row-major):
+//   A is M x K   (activations),   int8
+//   B is K x N   (weights),        int8     B[k][n] = B[k*N + n]
+//   C is M x N   (accumulators),   int32    C[m][n] = sum_k A[m][k] * B[k][n]
+// For gemm_upload the host sends B already in the K x N layout above; the DSP
+// prepacks it into an interleaved tile layout and stores it under `handle`.
 //============================================================================
 
 #include "AEEStdDef.idl"
@@ -20,7 +40,7 @@ interface cdsp_gemm : remote_handle64 {
    // one-time DSP-side setup (HVX mode check). no data.
    long rpc_init();
 
-   // C (MxN, int32) = A (MxK, int8) * B (KxN, int8).
+   // C (MxN, int32) = A (MxK, int8) * B (KxN, int8).  One-shot (no caching).
    // A/B are "in"; dims = [M, N, K] as a tiny "in" sequence (this qaic build
    // rejects plain scalar value params, so dimensions ride in a sequence);
    // C is "rout" (host allocates + sizes).
@@ -29,4 +49,23 @@ interface cdsp_gemm : remote_handle64 {
                   in  sequence<int8>  B,
                   in  sequence<int32>  dims,
                   rout sequence<int32> C);
+
+   // Upload + prepack the (large) int8 weight B (KxN) on the DSP and return a
+   // handle. dims = [0, N, K]. The prepacked weight is stored in a per-session
+   // table on the DSP and reused by gemm_compute_cached without re-transport.
+   // `handle` (out) is the integer key the host must present on every compute.
+   long gemm_upload(in  sequence<int8>  B,
+                    in  sequence<int32> dims,
+                    rout int32         handle);
+
+   // C (MxN, int32) = A (MxK, int8) @ cached weight (KxN) identified by handle.
+   // dims = [M, N, K]. Only the small activation A is transported; the weight
+   // is already resident on the DSP. This is the hot path used every token.
+   long gemm_compute_cached(in  sequence<int8>  A,
+                            in  sequence<int32>  dims,
+                            in  int32           handle,
+                            rout sequence<int32> C);
+
+   // Release a previously uploaded weight handle, freeing its DSP memory.
+   long gemm_release(in int32 handle);
 };

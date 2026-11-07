@@ -33,6 +33,7 @@ CDSP_PATH  = "/usr/lib/rfsa/cdsp/libgemm_skel.so"
 # local file -> remote relative path inside DEVICE_DIR
 LOCAL_FILES = [
     (os.path.join(SRC_HOST, "host_test.c"),        "host_test.c"),
+    (os.path.join(SRC_HOST, "host_test_cached.c"), "host_test_cached.c"),
     (os.path.join(GEN_DIR,  "gemm.h"),             "gen/gemm.h"),
     (os.path.join(GEN_DIR,  "cdsp_gemm_stub.c"),   "gen/cdsp_gemm_stub.c"),
     (os.path.join(SRC_DSP,  "AEEStdDef.h"),        "AEEStdDef.h"),
@@ -41,6 +42,13 @@ LOCAL_FILES = [
 ]
 
 SIZES = [(32, 128, 128), (64, 256, 256), (128, 512, 512)]
+
+# Real model-dimension shapes for the weight-cache test, to show the decode
+# win: a 4B model's attention/MLP weights are tens of MB, so shipping them over
+# FastRPC on every token is fatal. With the cache, only the tiny activation A
+# (M x K) is shipped per call.
+#   (M, N, K)  M=decode rows (1), N=weight cols, K=contraction
+SIZES_CACHED = [(1, 4096, 4096), (1, 11008, 4096), (32, 4096, 4096)]
 
 
 def main():
@@ -60,6 +68,9 @@ def main():
         f"cd {DEVICE_DIR} && "
         "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
         "host_test.c gen/cdsp_gemm_stub.c -o host_test "
+        "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
+        "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
+        "host_test_cached.c gen/cdsp_gemm_stub.c -o host_test_cached "
         "-L/usr/local/lib -ladsprpc -lpthread -ldl"
     )
     out, err, st = run(c, compile_cmd, timeout=120)
@@ -87,7 +98,16 @@ def main():
     for (M, N, K) in SIZES:
         cmd = f"cd {DEVICE_DIR} && ./host_test {M} {N} {K}"
         out, err, st = run(c, cmd, timeout=60)
-        print(f"\n=== host_test {M}x{N}x{K} (rc={st}) ===")
+        print(f"\n=== host_test (one-shot) {M}x{N}x{K} (rc={st}) ===")
+        print(out)
+        if err:
+            print("STDERR:", err)
+
+    # Stage-5 weight-cache test (upload once, reuse handle; only A shipped)
+    for (M, N, K) in SIZES + SIZES_CACHED:
+        cmd = f"cd {DEVICE_DIR} && ./host_test_cached {M} {N} {K}"
+        out, err, st = run(c, cmd, timeout=120)
+        print(f"\n=== host_test_cached (weight-cache) {M}x{N}x{K} (rc={st}) ===")
         print(out)
         if err:
             print("STDERR:", err)

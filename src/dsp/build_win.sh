@@ -16,7 +16,10 @@ QURT_LIB="$SDK/rtos/qurt/computev66/lib/pic"   # PIC libs for -fPIC shared obj
 HEX_INC="$SDK/tools/HEXAGON_Tools/8.4.11/Tools/target/hexagon/include"  # HVX intrinsics
 
 IDL=gemm.idl
-GEN=gen
+# Regenerate the QAIC artifacts (gemm.h / cdsp_gemm_skel.c / cdsp_gemm_stub.c)
+# into the repository's committed src/gen/ directory (the canonical copy that the
+# device deploy scripts ship). Kept in sync with gemm.idl on every build.
+GEN="$(dirname "$0")/../gen"
 # QAIC names the skel library after the .idl FILE name (gemm.idl -> libgemm_skel.so),
 # and bakes that into cdsp_gemm_URI. So the output .so MUST be named libgemm_skel.so
 # or the open() URI won't match.

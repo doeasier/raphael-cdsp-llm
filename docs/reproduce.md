@@ -64,8 +64,8 @@ What it does:
 Sanity check the build (run from `src/dsp`):
 
 ```bash
-nm -D ../../prebuilt/libgemm_skel.so | grep -iE "cdsp_gemm_(open|close|rpc_init|gemm_int8)"
-# all four must be 'T' (defined). Missing open/close => DSP dlopen fails with 0x80000406.
+nm -D ../../prebuilt/libgemm_skel.so | grep -iE "cdsp_gemm_(open|close|rpc_init|gemm_int8|gemm_upload|gemm_compute_cached|gemm_release)"
+# all seven must be 'T' (defined). Missing open/close => DSP dlopen fails with 0x80000406.
 ```
 
 ---
@@ -113,6 +113,24 @@ cd /data/local/tmp/cdsp_gemm
 ```
 
 All three print `host: PASS`.
+
+The same script also builds and runs **`host_test_cached`** — the Stage 5
+validation of the weight-cache API. It uploads the weight `B` once
+(`gemm_upload` → a handle), then calls `gemm_compute_cached` (only `A` shipped)
+and verifies the result matches the reference:
+
+```
+=== host_test_cached (weight-cache) 1x11008x4096 (rc=0) ===
+host: gemm_upload done -> weight handle=1 in 672.05 ms
+host: gemm_compute_cached done (M=1 N=11008 K=4096) in 37.42 ms
+host: PASS - all 11008 elements verified correct.
+host: gemm_release rc=0
+```
+
+The 672 ms `upload` is the **one-time** cost of shipping the ~45 MB weight to the
+DSP; the 37 ms `compute_cached` is what every subsequent token pays (only the tiny
+activation `A` is shipped). Compare with the naive one-shot path which re-ships the
+whole weight on every call (≈ 762 ms/token at this size).
 
 ---
 
@@ -175,6 +193,32 @@ With `GGML_CDSP_DEBUG=1` you also see the offload line:
 
 ---
 
+## 4. Stage 5 — weight-cache RPC (upload once, reuse handle)
+
+The same `deploy_ggml_cdsp.py` continues with `test_cache.cpp`, which builds a
+`MUL_MAT` graph, computes it **twice with the same weight tensor**, and verifies:
+
+1. both runs are bit-identical to the CPU int8 emulation (the cache path is
+   correct), and
+2. the **second** run is a cache **HIT** — the weight is *not* re-uploaded.
+
+With `GGML_CDSP_DEBUG=1` the backend prints `cache hits=1 misses=1`, and the
+deploy script greps for it to confirm reuse:
+
+```
+OK: 2 computes ran; max abs error vs int8-emu = 0.000000
+CACHE_TEST PASS
+>>> CONFIRMED: cached weights reused across computes (no re-upload of the weight matrix).
+>>> Stage 5 VERIFIED: weight-cache API works end-to-end (correct + weights uploaded once).
+```
+
+The plugin's LRU cache size is tunable via `GGML_CDSP_CACHE_MB` (default 256 MB).
+For a real model whose int8 weights exceed that, the least-recently-used weights
+are released and re-uploaded on next use — see [docs/next-steps.md](next-steps.md)
+for the capacity caveat.
+
+---
+
 ## 5. Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -189,7 +233,16 @@ With `GGML_CDSP_DEBUG=1` you also see the offload line:
 
 ## 6. What is NOT done yet
 
-End-to-end llama.cpp *inference* is **not** yet usable: the backend re-ships the
-entire weight matrix on every `MUL_MAT` call (see [docs/next-steps.md](next-steps.md)).
-The stages above prove correctness and the integration path; the next milestone
-is weight caching + HVX peak tuning.
+The weight-cache structural blocker is **solved** (Stage 5): weights are uploaded
+once and reused. What remains before real llama.cpp inference is genuinely useful:
+
+- **HVX peak tuning** — effective compute is still only ~4 GMAC/s vs the V66 HVX
+  ceiling (~150–200 GMAC/s). The prepack is already out of the hot path; closing
+  this gap is now the dominant lever (see [docs/next-steps.md](next-steps.md) §2).
+- **cDSP memory capacity** — the weight cache holds the model as int8 on the DSP.
+  A 4B model is ~4 GB int8, far more than the cDSP can hold, so the 256 MB default
+  cache will thrash for such models. Small models, or a larger cache on devices
+  with more DSP RAM, avoid this. Real end-to-end inference still needs to be run
+  and measured (§3 of next-steps.md).
+- Only `GGML_OP_MUL_MAT` is offloaded; all other ops run on the CPU. By design for
+  this PoC.

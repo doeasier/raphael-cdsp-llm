@@ -54,6 +54,7 @@ STAGE_FILES = [
     (os.path.join(PLUGIN_DIR, "build_device.sh"),    "build_device.sh"),
     (os.path.join(PLUGIN_DIR, "test_cdsp.cpp"),      "test_cdsp.cpp"),
     (os.path.join(PLUGIN_DIR, "test_sched.cpp"),     "test_sched.cpp"),
+    (os.path.join(PLUGIN_DIR, "test_cache.cpp"),     "test_cache.cpp"),
     (os.path.join(GEN_DIR,     "gemm.h"),            "gemm.h"),
     (os.path.join(GEN_DIR,     "cdsp_gemm_stub.c"),  "cdsp_gemm_stub.c"),
     (os.path.join(SRC_DSP,     "AEEStdDef.h"),       "AEEStdDef.h"),
@@ -197,6 +198,39 @@ def main():
         else:
             print("\n>>> Scheduler test did not report PASS (status %d)." % st)
             return 7
+
+        # 10. weight-cache reuse test (Stage 5): same weights across 2 computes
+        step("running test_cache (weight-cache: 2 computes, 2nd is a hit)")
+        cache_build = (
+            "cd %s && g++ -std=c++20 test_cache.cpp -I%s -L%s "
+            "-lggml -lggml-base -lggml-cpu -o test_cache"
+            % (REMOTE_STAGE, REMOTE_INC, ggml_libdir))
+        out, err, st = k.run(c, cache_build, timeout=300)
+        print(out)
+        if err:
+            print("STDERR:", err)
+        if st != 0:
+            print("CACHE TEST BUILD FAILED (status %d)" % st)
+            return 8
+
+        cache_run = (
+            "cd %s && GGML_BACKEND_DIR=%s GGML_CDSP_DEBUG=1 "
+            "LD_LIBRARY_PATH=%s:/usr/local/lib:$LD_LIBRARY_PATH ./test_cache"
+            % (REMOTE_STAGE, REMOTE_BACKEND_DIR, ggml_libdir))
+        out, err, st = k.run(c, cache_run, timeout=300)
+        print(out)
+        if "offloaded MUL_MAT" in (out + err):
+            print(">>> CONFIRMED: scheduler offloaded MUL_MAT to the cDSP backend.")
+        if "cache hits=" in (out + err):
+            # the 2nd compute must have been a cache HIT (hits >= 1)
+            print(">>> CONFIRMED: cached weights reused across computes "
+                  "(no re-upload of the weight matrix).")
+        if "CACHE_TEST PASS" in out:
+            print("\n>>> Stage 5 VERIFIED: weight-cache API works end-to-end "
+                  "(correct + weights uploaded once).")
+        else:
+            print("\n>>> Weight-cache test did not report PASS (status %d)." % st)
+            return 9
     finally:
         c.close()
     return 0

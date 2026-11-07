@@ -5,9 +5,9 @@ The DSP-side implementation of the int8 GEMM kernel, compiled into
 
 | File | Purpose |
 |---|---|
-| `gemm.idl` | FastRPC interface: `C(M×N,int32) = A(M×K,int8) · B(K×N,int8)`. |
-| `gemm_dsp.c` | HVX (vrmpy) int8 GEMM. `open/close/rpc_init/gemm_int8` are all defined. |
-| `build_win.sh` | Hexagon SDK build → `../../prebuilt/libgemm_skel.so`. Needs `-mhvx` (not `-mhvx=128`). |
+| `gemm.idl` | FastRPC interface: `gemm_int8` (one-shot) + `gemm_upload`/`gemm_compute_cached`/`gemm_release` (weight-cache, Stage 5). |
+| `gemm_dsp.c` | HVX (vrmpy) int8 GEMM + per-session weight-cache table. `open/close/rpc_init/gemm_int8/gemm_upload/gemm_compute_cached/gemm_release` all defined. |
+| `build_win.sh` | Hexagon SDK build → `../../prebuilt/libgemm_skel.so`. Needs `-mhvx` (not `-mhvx=128`). Regenerates `../gen`. |
 | `AEEStdDef.h`, `AEEStdErr.h` | SDK headers referenced by the generated stub. |
 
 Build (Windows, needs Hexagon SDK 4.3.0.0):

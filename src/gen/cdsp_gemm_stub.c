@@ -423,14 +423,14 @@ struct Interface {
 
 static const Type types[2];
 static const Type types[2] = {{0x1,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x1},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4}};
-static const Parameter parameters[6] = {{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)0x0,0}}, 4,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),3,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[0]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[1]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[1]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),3,0}};
-static const Parameter* const parameterArrays[7] = {(&(parameters[3])),(&(parameters[3])),(&(parameters[4])),(&(parameters[5])),(&(parameters[0])),(&(parameters[1])),(&(parameters[2]))};
-static const Method methods[4] = {{REMOTE_SCALARS_MAKEX(0,0,0x2,0x0,0x0,0x1),0x4,0x0,2,2,(&(parameterArrays[4])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x1,0x0),0x0,0x0,1,1,(&(parameterArrays[6])),0x1,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x0,0x0),0x0,0x0,0,0,0,0x0,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x4,0x1,0x0,0x0),0x10,0x0,9,4,(&(parameterArrays[0])),0x4,0x1}};
-static const Method* const methodArrays[4] = {&(methods[0]),&(methods[1]),&(methods[2]),&(methods[3])};
-static const char strings[48] = "gemm_int8\0rpc_init\0close\0dims\0open\0uri\0C\0B\0A\0h\0";
-static const uint16_t methodStrings[11] = {0,43,41,25,39,30,35,45,19,45,10};
-static const uint16_t methodStringsArrays[4] = {5,8,10,0};
-__QAIC_SLIM_EXPORT const Interface __QAIC_SLIM(cdsp_gemm_slim) = {4,&(methodArrays[0]),0,0,&(methodStringsArrays [0]),methodStrings,strings};
+static const Parameter parameters[8] = {{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)0x0,0}}, 4,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),3,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[0]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[1]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)&(types[1]),(const uintptr_t)0x0}}, 9,SLIM_IFPTR32(0x4,0x8),3,0},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4,3,0},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4,0,0}};
+static const Parameter* const parameterArrays[14] = {(&(parameters[3])),(&(parameters[4])),(&(parameters[7])),(&(parameters[5])),(&(parameters[3])),(&(parameters[3])),(&(parameters[4])),(&(parameters[5])),(&(parameters[3])),(&(parameters[4])),(&(parameters[6])),(&(parameters[0])),(&(parameters[1])),(&(parameters[2]))};
+static const Method methods[7] = {{REMOTE_SCALARS_MAKEX(0,0,0x2,0x0,0x0,0x1),0x4,0x0,2,2,(&(parameterArrays[11])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x1,0x0),0x0,0x0,1,1,(&(parameterArrays[13])),0x1,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x0,0x0),0x0,0x0,0,0,0,0x0,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x4,0x1,0x0,0x0),0x10,0x0,9,4,(&(parameterArrays[4])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x3,0x1,0x0,0x0),0x8,0x4,5,3,(&(parameterArrays[8])),0x4,0x4},{REMOTE_SCALARS_MAKEX(0,0,0x3,0x1,0x0,0x0),0x10,0x0,8,4,(&(parameterArrays[0])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x4,0x0,1,1,(&(parameterArrays[2])),0x4,0x0}};
+static const Method* const methodArrays[7] = {&(methods[0]),&(methods[1]),&(methods[2]),&(methods[3]),&(methods[4]),&(methods[5]),&(methods[6])};
+static const char strings[100] = "gemm_compute_cached\0gemm_release\0gemm_upload\0gemm_int8\0rpc_init\0handle\0close\0dims\0open\0uri\0C\0B\0A\0h\0";
+static const uint16_t methodStrings[22] = {0,95,77,64,91,45,95,93,77,91,33,93,77,64,82,87,97,20,64,71,97,55};
+static const uint16_t methodStringsArrays[7] = {14,19,21,5,10,0,17};
+__QAIC_SLIM_EXPORT const Interface __QAIC_SLIM(cdsp_gemm_slim) = {7,&(methodArrays[0]),0,0,&(methodStringsArrays [0]),methodStrings,strings};
 #endif //_CDSP_GEMM_SLIM_H
 
 
@@ -486,6 +486,79 @@ static __inline int _stub_method_1(remote_handle64 _handle, uint32_t _mid, char*
 __QAIC_STUB_EXPORT int __QAIC_STUB(cdsp_gemm_gemm_int8)(remote_handle64 _handle, const int8* A, int ALen, const int8* B, int BLen, const int32* dims, int dimsLen, int32* C, int CLen) __QAIC_STUB_ATTRIBUTE {
    uint32_t _mid = 3;
    return _stub_method_1(_handle, _mid, (char**)&A, (uint32_t*)&ALen, (char**)&B, (uint32_t*)&BLen, (char**)&dims, (uint32_t*)&dimsLen, (char**)&C, (uint32_t*)&CLen);
+}
+static __inline int _stub_method_2(remote_handle64 _handle, uint32_t _mid, char* _in0[1], uint32_t _in0Len[1], char* _in1[1], uint32_t _in1Len[1], uint32_t _rout2[1]) {
+   int _numIn[1];
+   remote_arg _pra[4];
+   uint32_t _primIn[2];
+   uint32_t _primROut[1];
+   remote_arg* _praIn;
+   int _nErr = 0;
+   _numIn[0] = 2;
+   _pra[0].buf.pv = (void*)_primIn;
+   _pra[0].buf.nLen = sizeof(_primIn);
+   _pra[(_numIn[0] + 1)].buf.pv = (void*)_primROut;
+   _pra[(_numIn[0] + 1)].buf.nLen = sizeof(_primROut);
+   _COPY(_primIn, 0, _in0Len, 0, 4);
+   _praIn = (_pra + 1);
+   _praIn[0].buf.pv = (void*) _in0[0];
+   _praIn[0].buf.nLen = (1 * _in0Len[0]);
+   _COPY(_primIn, 4, _in1Len, 0, 4);
+   _praIn[1].buf.pv = (void*) _in1[0];
+   _praIn[1].buf.nLen = (4 * _in1Len[0]);
+   _TRY(_nErr, __QAIC_REMOTE(remote_handle64_invoke)(_handle, REMOTE_SCALARS_MAKEX(0, _mid, 3, 1, 0, 0), _pra));
+   _COPY(_rout2, 0, _primROut, 0, 4);
+   _CATCH(_nErr) {}
+   return _nErr;
+}
+__QAIC_STUB_EXPORT int __QAIC_STUB(cdsp_gemm_gemm_upload)(remote_handle64 _handle, const int8* B, int BLen, const int32* dims, int dimsLen, int32* handle) __QAIC_STUB_ATTRIBUTE {
+   uint32_t _mid = 4;
+   return _stub_method_2(_handle, _mid, (char**)&B, (uint32_t*)&BLen, (char**)&dims, (uint32_t*)&dimsLen, (uint32_t*)handle);
+}
+static __inline int _stub_method_3(remote_handle64 _handle, uint32_t _mid, char* _in0[1], uint32_t _in0Len[1], char* _in1[1], uint32_t _in1Len[1], uint32_t _in2[1], char* _rout3[1], uint32_t _rout3Len[1]) {
+   int _numIn[1];
+   remote_arg _pra[4];
+   uint32_t _primIn[4];
+   remote_arg* _praIn;
+   remote_arg* _praROut;
+   int _nErr = 0;
+   _numIn[0] = 2;
+   _pra[0].buf.pv = (void*)_primIn;
+   _pra[0].buf.nLen = sizeof(_primIn);
+   _COPY(_primIn, 0, _in0Len, 0, 4);
+   _praIn = (_pra + 1);
+   _praIn[0].buf.pv = (void*) _in0[0];
+   _praIn[0].buf.nLen = (1 * _in0Len[0]);
+   _COPY(_primIn, 4, _in1Len, 0, 4);
+   _praIn[1].buf.pv = (void*) _in1[0];
+   _praIn[1].buf.nLen = (4 * _in1Len[0]);
+   _COPY(_primIn, 8, _in2, 0, 4);
+   _COPY(_primIn, 12, _rout3Len, 0, 4);
+   _praROut = (_praIn + _numIn[0] + 0);
+   _praROut[0].buf.pv = _rout3[0];
+   _praROut[0].buf.nLen = (4 * _rout3Len[0]);
+   _TRY(_nErr, __QAIC_REMOTE(remote_handle64_invoke)(_handle, REMOTE_SCALARS_MAKEX(0, _mid, 3, 1, 0, 0), _pra));
+   _CATCH(_nErr) {}
+   return _nErr;
+}
+__QAIC_STUB_EXPORT int __QAIC_STUB(cdsp_gemm_gemm_compute_cached)(remote_handle64 _handle, const int8* A, int ALen, const int32* dims, int dimsLen, int32 handle, int32* C, int CLen) __QAIC_STUB_ATTRIBUTE {
+   uint32_t _mid = 5;
+   return _stub_method_3(_handle, _mid, (char**)&A, (uint32_t*)&ALen, (char**)&dims, (uint32_t*)&dimsLen, (uint32_t*)&handle, (char**)&C, (uint32_t*)&CLen);
+}
+static __inline int _stub_method_4(remote_handle64 _handle, uint32_t _mid, uint32_t _in0[1]) {
+   remote_arg _pra[1];
+   uint32_t _primIn[1];
+   int _nErr = 0;
+   _pra[0].buf.pv = (void*)_primIn;
+   _pra[0].buf.nLen = sizeof(_primIn);
+   _COPY(_primIn, 0, _in0, 0, 4);
+   _TRY(_nErr, __QAIC_REMOTE(remote_handle64_invoke)(_handle, REMOTE_SCALARS_MAKEX(0, _mid, 1, 0, 0, 0), _pra));
+   _CATCH(_nErr) {}
+   return _nErr;
+}
+__QAIC_STUB_EXPORT int __QAIC_STUB(cdsp_gemm_gemm_release)(remote_handle64 _handle, int32 handle) __QAIC_STUB_ATTRIBUTE {
+   uint32_t _mid = 6;
+   return _stub_method_4(_handle, _mid, (uint32_t*)&handle);
 }
 #ifdef __cplusplus
 }
