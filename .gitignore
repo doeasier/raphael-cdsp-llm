@@ -1,0 +1,11 @@
+# Build artifacts / local scratch (keep sources + prebuilt/ + deps/)
+tmp/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.bak
+*.swp
+.DS_Store
+
+# Keep prebuilt/libgemm_skel.so and deps/ggml-0.9.0-headers/* — they are source.

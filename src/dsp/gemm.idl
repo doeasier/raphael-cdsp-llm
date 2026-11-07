@@ -1,0 +1,32 @@
+//============================================================================
+// gemm.idl - FastRPC IDL: int8 GEMM offload to cDSP (Hexagon 690 / V66 / HVX)
+//
+// This is the compute kernel for the self-written llama.cpp cDSP backend.
+// The host (applications processor) ships two int8 matrices A (MxK) and
+// B (KxN) to the DSP; the DSP computes C = A * B (int8 x int8 -> int32) and
+// returns C (MxN, int32). Per-row / per-tensor rescaling to float is done on
+// the host side (llama.cpp already carries the scales).
+//
+// QAIC method naming: interface X : remote_handle64 { long foo(...); }
+//   -> cdsp_gemm_foo(remote_handle64 _h, ...)
+//   -> cdsp_gemm_open / cdsp_gemm_close
+//   -> pointers go through rpcmem shared memory automatically.
+//============================================================================
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface cdsp_gemm : remote_handle64 {
+   // one-time DSP-side setup (HVX mode check). no data.
+   long rpc_init();
+
+   // C (MxN, int32) = A (MxK, int8) * B (KxN, int8).
+   // A/B are "in"; dims = [M, N, K] as a tiny "in" sequence (this qaic build
+   // rejects plain scalar value params, so dimensions ride in a sequence);
+   // C is "rout" (host allocates + sizes).
+   // NOTE: QAIC requires the "rout" param to be last in the parameter list.
+   long gemm_int8(in  sequence<int8>  A,
+                  in  sequence<int8>  B,
+                  in  sequence<int32>  dims,
+                  rout sequence<int32> C);
+};
