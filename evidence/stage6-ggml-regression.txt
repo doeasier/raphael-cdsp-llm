@@ -1,0 +1,83 @@
+
+=== assembling staging dir ===
+staged 14 files in F:\work\WorkBuddy\raphael-cdsp-llm\tmp\ggml-cdsp-staging
+
+=== connecting to device ===
+
+=== uploading ggml 0.9.0 public headers -> /data/local/tmp/ggml-include ===
+
+=== uploading plugin staging -> /data/local/tmp/ggml-cdsp ===
+
+=== device pre-flight checks ===
+SKEL_OK
+/usr/bin/g++
+g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+/data/local/tmp/ggml-include/ggml-backend.h
+/data/local/tmp/ggml-include/ggml.h
+
+
+=== building libggml-cdsp.so on device ===
+[*] GGML_INCLUDE   = /data/local/tmp/ggml-include
+[*] FASTRPC_INCLUDE= /usr/local/include/fastrpc
+[*] ADSPRPC_LIBDIR = /usr/local/lib
+[*] built libggml-cdsp.so
+libggml-cdsp.so: ELF 64-bit LSB shared object, ARM aarch64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=dd6dd0704450a47e6a4b8256f7df7194a1185086, not stripped
+
+-rwxr-xr-x 1 root root 185280 11月  7 22:35 /data/local/tmp/ggml-cdsp/libggml-cdsp.so
+
+
+=== installing into /data/local/tmp/ggml-backend ===
+
+=== locating libggml.so and building test_cdsp ===
+libggml at: /root/llama.cpp-0.9.0/build/bin/libggml.so
+
+
+=== running test_cdsp (cDSP MUL_MAT vs int8 emulation) ===
+OK: loaded backend 'cdsp'
+OK: MUL_MAT computed on cDSP; max abs error vs int8-emulation = 0.000000
+PASS
+
+STDERR: load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+
+
+>>> Stage 2 VERIFIED: cDSP backend computes MUL_MAT correctly.
+
+=== running test_sched (scheduler: MUL_MAT->cDSP, relu->CPU) ===
+
+OK: loaded cDSP backend 'cdsp'
+OK: loaded CPU backend 'CPU'
+OK: scheduler ran MUL_MAT(cDSP)+relu(CPU); max abs error vs int8-emu = 0.000000
+SCHED_TEST PASS
+
+>>> CONFIRMED: scheduler offloaded MUL_MAT to the cDSP backend.
+
+>>> Stage 2.5 VERIFIED: backend integrates under the ggml multi-backend scheduler (cDSP + CPU).
+
+=== running test_cache (weight-cache: 2 computes, 2nd is a hit) ===
+
+OK: loaded cDSP backend 'cdsp'
+OK: 2 computes ran; max abs error vs int8-emu = 0.000000
+CACHE_TEST PASS
+
+>>> CONFIRMED: scheduler offloaded MUL_MAT to the cDSP backend.
+>>> CONFIRMED: cached weights reused across computes (no re-upload of the weight matrix).
+
+>>> Stage 5 VERIFIED: weight-cache API works end-to-end (correct + weights uploaded once).
+
+=== running test_q4k (Q4_K dequant vs ggml's own CPU kernel) ===
+
+Q4_K : 18432 bytes (expected 18432), row = 288 bytes
+  CPU range=21.8386  max abs err=0.092793  mean=0.026908  rel max err=0.0042 (0.42%)
+  Q4_K_TEST PASS
+Q8_0 : 34816 bytes (expected 34816), row = 544 bytes
+  CPU range=22.1612  max abs err=0.153400  mean=0.038258  rel max err=0.0069 (0.69%)
+  Q8_0_TEST PASS
+Q4K_TEST PASS
+
+>>> CONFIRMED: real Q4_K weight blocks decode correctly on the cDSP.
+
+=== building libggml_cdsp_preload.so (llama.cpp integration shim) ===
+-rwxr-xr-x 1 root root 69960 11月  7 22:35 /data/local/tmp/ggml-backend/libggml_cdsp_preload.so
+
+
+>>> Stage 6 READY: see docs/llama-integration.md for the llama-cli / llama-server integration commands.

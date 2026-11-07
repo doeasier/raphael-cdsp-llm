@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy + verify the ggml-cdsp backend on the K20 Pro (Stages 2 & 2.5).
+"""Deploy + verify the ggml-cdsp backend on the K20 Pro (Stages 2, 2.5, 5, 6).
 
 What it does (all over USB-NCM SSH, root@172.16.42.1):
   1. Uploads the ggml 0.9.0 public headers to /data/local/tmp/ggml-include
@@ -14,6 +14,14 @@ What it does (all over USB-NCM SSH, root@172.16.42.1):
      CPU int8 emulation (tiny tolerance) -> prints PASS/FAIL.
   6. Builds + runs test_sched.cpp to prove the backend integrates under the
      ggml multi-backend scheduler (MUL_MAT -> cDSP, other ops -> CPU).
+  7. Builds + runs test_cache.cpp (Stage 5 weight-cache reuse, 2nd compute is
+     a cache hit).
+  8. Builds + runs test_q4k.cpp: REAL Q4_K weight blocks (the format used by
+     Qwen3.5-4B-Q4_K_M.gguf) computed by both the CPU and cDSP backends, to
+     validate the dequantization path.
+  9. Builds libggml_cdsp_preload.so, the LD_PRELOAD shim that registers this
+     out-of-tree backend into a llama.cpp build with GGML_BACKEND_DL=OFF
+     (see docs/llama-integration.md).
 
 Prerequisites on the device:
   * g++ with C++20, libadsprpc (+ system <remote.h>).
@@ -55,6 +63,8 @@ STAGE_FILES = [
     (os.path.join(PLUGIN_DIR, "test_cdsp.cpp"),      "test_cdsp.cpp"),
     (os.path.join(PLUGIN_DIR, "test_sched.cpp"),     "test_sched.cpp"),
     (os.path.join(PLUGIN_DIR, "test_cache.cpp"),     "test_cache.cpp"),
+    (os.path.join(PLUGIN_DIR, "test_q4k.cpp"),       "test_q4k.cpp"),
+    (os.path.join(PLUGIN_DIR, "cdsp_preload.c"),     "cdsp_preload.c"),
     (os.path.join(GEN_DIR,     "gemm.h"),            "gemm.h"),
     (os.path.join(GEN_DIR,     "cdsp_gemm_stub.c"),  "cdsp_gemm_stub.c"),
     (os.path.join(SRC_DSP,     "AEEStdDef.h"),       "AEEStdDef.h"),
@@ -231,6 +241,50 @@ def main():
         else:
             print("\n>>> Weight-cache test did not report PASS (status %d)." % st)
             return 9
+
+        # 11. Q4_K dequant correctness - the weight format of real GGUF models
+        step("running test_q4k (Q4_K dequant vs ggml's own CPU kernel)")
+        q4k_build = (
+            "cd %s && g++ -std=c++20 test_q4k.cpp -I%s -L%s "
+            "-lggml -lggml-base -lggml-cpu -o test_q4k"
+            % (REMOTE_STAGE, REMOTE_INC, ggml_libdir))
+        out, err, st = k.run(c, q4k_build, timeout=300)
+        print(out)
+        if err:
+            print("STDERR:", err)
+        if st != 0:
+            print("Q4K TEST BUILD FAILED (status %d)" % st)
+            return 10
+        q4k_run = (
+            "cd %s && GGML_CDSP_BACKEND=%s/libggml-cdsp.so "
+            "LD_LIBRARY_PATH=%s:/usr/local/lib:$LD_LIBRARY_PATH ./test_q4k"
+            % (REMOTE_STAGE, REMOTE_BACKEND_DIR, ggml_libdir))
+        out, err, st = k.run(c, q4k_run, timeout=300)
+        print(out)
+        if "Q4K_TEST PASS" in out:
+            print(">>> CONFIRMED: real Q4_K weight blocks decode correctly on the cDSP.")
+        else:
+            print(">>> Q4_K test did not report PASS (status %d)." % st)
+            return 11
+
+        # 12. LD_PRELOAD shim: registers this out-of-tree backend into a
+        # llama.cpp build with GGML_BACKEND_DL=OFF (where GGML_BACKEND_PATH is
+        # never reached because the CPU backend is statically registered).
+        step("building libggml_cdsp_preload.so (llama.cpp integration shim)")
+        shim_build = (
+            "cd %s && gcc -shared -fPIC -O2 cdsp_preload.c "
+            "-o %s/libggml_cdsp_preload.so -ldl && "
+            "ls -l %s/libggml_cdsp_preload.so"
+            % (REMOTE_STAGE, REMOTE_BACKEND_DIR, REMOTE_BACKEND_DIR))
+        out, err, st = k.run(c, shim_build, timeout=180)
+        print(out)
+        if err:
+            print("STDERR:", err)
+        if st != 0:
+            print("PRELOAD SHIM BUILD FAILED (status %d)" % st)
+            return 12
+        print("\n>>> Stage 6 READY: see docs/llama-integration.md for the "
+              "llama-cli / llama-server integration commands.")
     finally:
         c.close()
     return 0

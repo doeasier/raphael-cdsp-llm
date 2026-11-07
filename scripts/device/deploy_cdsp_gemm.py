@@ -6,7 +6,10 @@ What it does:
   1. SFTP the host test + QAIC-generated stub/header + the DSP .so to the device.
   2. Compile host_test on the device (aarch64 gcc + libadsprpc).
   3. Install libgemm_skel.so into the cDSP search path (/usr/lib/rfsa/cdsp).
-  4. Run host_test at a few sizes and report PASS/FAIL + DSP compute time.
+  4. Run host_test / host_test_cached at several sizes and report PASS/FAIL.
+  5. Run bench_cached (Stage 6 HVX microbenchmark): FastRPC ping, decode,
+     square and prompt-batch shapes, with a DSP warm-up pass to avoid DVFS
+     cold-clock numbers. Reports ms/call and effective GMAC/s.
 
 The DSP .so is built on Windows beforehand via src/dsp/build_win.sh
 (or use the committed prebuilt/libgemm_skel.so).
@@ -34,6 +37,7 @@ CDSP_PATH  = "/usr/lib/rfsa/cdsp/libgemm_skel.so"
 LOCAL_FILES = [
     (os.path.join(SRC_HOST, "host_test.c"),        "host_test.c"),
     (os.path.join(SRC_HOST, "host_test_cached.c"), "host_test_cached.c"),
+    (os.path.join(SRC_HOST, "bench_cached.c"),     "bench_cached.c"),
     (os.path.join(GEN_DIR,  "gemm.h"),             "gen/gemm.h"),
     (os.path.join(GEN_DIR,  "cdsp_gemm_stub.c"),   "gen/cdsp_gemm_stub.c"),
     (os.path.join(SRC_DSP,  "AEEStdDef.h"),        "AEEStdDef.h"),
@@ -49,6 +53,21 @@ SIZES = [(32, 128, 128), (64, 256, 256), (128, 512, 512)]
 # (M x K) is shipped per call.
 #   (M, N, K)  M=decode rows (1), N=weight cols, K=contraction
 SIZES_CACHED = [(1, 4096, 4096), (1, 11008, 4096), (32, 4096, 4096)]
+
+# Stage 6 HVX microbenchmark shapes: (M, N, K, iterations)
+#   1x32x4        ~ pure FastRPC round-trip (128 MACs)
+#   1x1024x2560   Qwen3.5-4B decode attention projection
+#   1x4096x4096   decode FFN
+#   128x512x512   the original 4.2 GMAC/s reference shape
+#   32x4096x4096  prompt batch (weight-streaming bound)
+BENCH_SHAPES = [
+    (1, 32, 4, 100),
+    (1, 32, 2560, 100),
+    (1, 1024, 2560, 60),
+    (1, 4096, 4096, 25),
+    (128, 512, 512, 30),
+    (32, 4096, 4096, 12),
+]
 
 
 def main():
@@ -71,6 +90,9 @@ def main():
         "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
         "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
         "host_test_cached.c gen/cdsp_gemm_stub.c -o host_test_cached "
+        "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
+        "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
+        "bench_cached.c gen/cdsp_gemm_stub.c -o bench_cached "
         "-L/usr/local/lib -ladsprpc -lpthread -ldl"
     )
     out, err, st = run(c, compile_cmd, timeout=120)
@@ -109,6 +131,19 @@ def main():
         out, err, st = run(c, cmd, timeout=120)
         print(f"\n=== host_test_cached (weight-cache) {M}x{N}x{K} (rc={st}) ===")
         print(out)
+        if err:
+            print("STDERR:", err)
+
+    # Stage 6: HVX throughput. The cDSP ramps its clock under sustained load;
+    # without this warm-up pass the first short shapes are 30-50% pessimistic.
+    print("\n=== bench_cached (Stage 6 HVX throughput) ===")
+    warm = f"cd {DEVICE_DIR} && ./bench_cached 128 512 512 200"
+    out, err, st = run(c, warm, timeout=180)
+    print("[warm-up]", out.strip())
+    for (M, N, K, iters) in BENCH_SHAPES:
+        cmd = f"cd {DEVICE_DIR} && ./bench_cached {M} {N} {K} {iters}"
+        out, err, st = run(c, cmd, timeout=180)
+        print(out.strip())
         if err:
             print("STDERR:", err)
 

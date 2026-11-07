@@ -5,17 +5,22 @@
 //
 // Design notes (modeled on the upstream ggml-hexagon registration pattern but
 // deliberately simplified for a research proof-of-concept):
-//   * We only claim to support GGML_OP_MUL_MAT (F32 act x {F32,Q8_0} weight),
-//     so the ggml scheduler keeps every other op on the CPU backend and only
-//     hands us MUL_MAT nodes. Our graph_compute therefore only ever sees
-//     MUL_MAT and never has to delegate other ops.
+//   * We only claim to support GGML_OP_MUL_MAT with an F32 activation and an
+//     {F32, Q8_0, Q4_K} weight, so the ggml scheduler keeps every other op on
+//     the CPU backend and only hands us MUL_MAT nodes. Our graph_compute
+//     therefore only ever sees MUL_MAT and never has to delegate other ops.
+//   * IMPORTANT: ggml_mul_mat(src0=weight [K,N], src1=activation [K,M]) ->
+//     dst [N,M]. This is the REAL llama.cpp convention (see ggml.h); the
+//     column-major data layout maps directly to Bf[n*K+k] / Ab[m*K+k] /
+//     Cb[m*N+n], so no extra transpose of the host tensors is needed.
 //   * Tensors live in the ordinary CPU host buffer (ggml_backend_cpu_buffer_type)
 //     - FastRPC copies them to the DSP and back - so we need no custom buffer
 //     implementation.
-//   * For each MUL_MAT we: quantize the activation rows to int8 (per-row
-//     scale), dequantize the (possibly Q8_0) weight to F32 then quantize its
-//     columns to int8 (per-column scale), transpose the weight, run the DSP
-//     int8 GEMM, then apply the scales on the host to recover F32 output.
+//   * For each MUL_MAT we: dequantize the (Q8_0 / Q4_K) weight to F32 then
+//     quantize its columns to int8 (per-column scale), transpose, upload+prepack
+//     ONCE on the DSP (weight cache), quantize the activation rows to int8
+//     (per-row scale), run the cached DSP int8 GEMM with only A shipped, then
+//     apply the scales on the host to recover F32 output.
 //
 // Build (on-device, aarch64 Linux): see build_device.sh
 // Registered as backend "cdsp".
@@ -56,17 +61,101 @@ static void quant_vec(const float * x, int n, int8_t * q, float * scale) {
     }
 }
 
-// Q8_0 layout per (K,N) weight block: [f32 scale][int8 x32] repeated over K/32.
+// IEEE 754 half -> float. ggml stores the Q8_0 / Q4_K block scales as fp16.
+// Used by both dequant_q8_0() and dequant_q4_k().
+static float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign; }
+        else {
+            uint32_t e = 0;
+            while (!(mant & 0x400)) { mant <<= 1; e++; }
+            mant &= 0x3FF;
+            f = sign | ((127 - 15 - e + 1) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        f = sign | (0xFFu << 23) | (mant << 13);
+    } else {
+        f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, 4);
+    return out;
+}
+
+// Q8_0 layout in ggml 0.9.0: block = [fp16 d][int8 qs[32]] = 34 bytes /
+// 32 weights. (Older ggml used an f32 scale / 36-byte block - do NOT use that
+// here, it silently corrupts every offloaded layer.)
+struct block_q8_0 {
+    uint16_t d;
+    int8_t   qs[32];
+};
+
 static void dequant_q8_0(const uint8_t * w, int K, int N, float * out) {
     const int bpk    = K / 32;          // blocks along K
-    const int stride = 36;              // 4 (scale) + 32 (int8)
+    const int stride = sizeof(block_q8_0); // 34
     for (int n = 0; n < N; n++) {
         for (int bk = 0; bk < bpk; bk++) {
-            const uint8_t * blk = w + ((size_t)n * bpk + bk) * stride;
-            float s = *(const float *)blk;
-            const int8_t * q = (const int8_t *)(blk + 4);
+            const block_q8_0 * blk =
+                (const block_q8_0 *)(w + ((size_t)n * bpk + bk) * stride);
+            const float s = fp16_to_fp32(blk->d);
             for (int j = 0; j < 32; j++) {
-                out[(size_t)n * K + (size_t)bk * 32 + j] = s * (float)q[j];
+                out[(size_t)n * K + (size_t)bk * 32 + j] = s * (float)blk->qs[j];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K (K-quant, 4-bit) dequant — copied verbatim from ggml 0.9.0
+// (ggml-quants.c: dequantize_row_q4_K / get_scale_min_k4). We must support this
+// because real models (e.g. Qwen3.5-4B-Q4_K_M) ship Q4_K weights; without it
+// the MUL_MAT never gets routed to the cDSP. Block = 144 B (d fp16, dmin fp16,
+// scales[K_SCALE_SIZE=12], qs[QK_K/2=128]) holding QK_K=256 weights.
+// NOTE: K_SCALE_SIZE is 12 in ggml 0.9.0 (ggml-common.h), NOT 8 - using 8
+// silently shifts every subsequent block and produces garbage outputs.
+// ---------------------------------------------------------------------------
+struct block_q4_K {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+};
+
+static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q,
+                                    uint8_t * GGML_RESTRICT d, uint8_t * GGML_RESTRICT m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+// fp16_to_fp32() is defined above (shared with dequant_q8_0).
+static void dequant_q4_k(const uint8_t * w, int K, int N, float * out) {
+    const int nb = K / 256;   // QK_K = 256
+    const block_q4_K * x = (const block_q4_K *)w;
+    float * y = out;
+    for (int n = 0; n < N; n++) {
+        const block_q4_K * xb = x + (size_t)n * nb;
+        for (int i = 0; i < nb; i++) {
+            const uint8_t * q = xb[i].qs;
+            const float d   = fp16_to_fp32(xb[i].d);
+            const float min = fp16_to_fp32(xb[i].dmin);
+            int is = 0;
+            uint8_t sc, m;
+            for (int j = 0; j < 256; j += 64) {
+                get_scale_min_k4(is + 0, xb[i].scales, &sc, &m);
+                const float d1 = d * sc; const float m1 = min * m;
+                get_scale_min_k4(is + 1, xb[i].scales, &sc, &m);
+                const float d2 = d * sc; const float m2 = min * m;
+                for (int l = 0; l < 32; ++l) *y++ = d1 * (float)(q[l] & 0xF) - m1;
+                for (int l = 0; l < 32; ++l) *y++ = d2 * (float)(q[l] >> 4)   - m2;
+                q += 32; is += 2;
             }
         }
     }
@@ -142,38 +231,143 @@ static void wcache_release_all(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Capability predicate. supports_op() and cdsp_mul_mat() MUST use the SAME
+// predicate: if the scheduler hands us an op that compute then rejects,
+// ggml_backend_sched_graph_compute_async() aborts the whole graph with -1
+// (observed on a real Qwen3.5-4B run where an extra batched MUL_MAT slipped
+// through). Keep every guard here and nowhere else.
+//
+// GGML_CDSP_MAX_ELEMS (optional): skip matrices whose weight element count
+// N*K exceeds this value, leaving them on the CPU. Useful for large models
+// where shipping every weight to the cDSP thrashes the cache (see §1.1 of
+// docs/next-steps.md). Unset / 0 = offload everything (full-offload mode).
+// ---------------------------------------------------------------------------
+static bool cdsp_can_mul_mat(const struct ggml_tensor * op) {
+    if (!op || op->op != GGML_OP_MUL_MAT) return false;
+    const struct ggml_tensor * w = op->src[0]; // weight     [K, N]
+    const struct ggml_tensor * a = op->src[1]; // activation [K, M]
+    if (!w || !a) return false;
+    if (op->type != GGML_TYPE_F32) return false;
+    if (a->type != GGML_TYPE_F32) return false;
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_Q8_0
+        && w->type != GGML_TYPE_Q4_K) return false;
+
+    const int64_t K = w->ne[0], N = w->ne[1], M = a->ne[1];
+    if (K <= 0 || M <= 0 || N <= 0) return false;
+    if (a->ne[0] != K) return false;
+    const int64_t B0 = a->ne[2] * a->ne[3];
+    const int64_t B1 = w->ne[2] * w->ne[3];
+    if (B1 != 1 && B1 != B0) return false;
+    if (w->type == GGML_TYPE_Q8_0 && (K % 32)  != 0) return false;
+    if (w->type == GGML_TYPE_Q4_K && (K % 256) != 0) return false;
+
+    const char * e = getenv("GGML_CDSP_MAX_ELEMS");
+    if (e && *e) {
+        long long lim = atoll(e);
+        if (lim > 0 && (long long)(N * K) > lim) return false;
+    }
+    // GGML_CDSP_MIN_ELEMS: leave tiny matmuls on the CPU. A real Qwen3.5-4B
+    // decode issues ~37 MUL_MATs of shape 1x32x2560 per token; each costs a
+    // FastRPC round-trip (~0.25 ms) for only 82k MACs, so offloading them is
+    // pure overhead. Skipping them cuts ~75% of the per-token RPC calls.
+    const char * emn = getenv("GGML_CDSP_MIN_ELEMS");
+    if (emn && *emn) {
+        long long lim = atoll(emn);
+        if (lim > 0 && (long long)(N * K) < lim) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // the actual MUL_MAT compute, dispatched to the cDSP
 // ---------------------------------------------------------------------------
 static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
-    struct ggml_tensor * src0 = dst->src[0]; // activation (F32)
-    struct ggml_tensor * src1 = dst->src[1]; // weight     (F32 or Q8_0)
+    // ggml MUL_MAT semantics (ggml.h / ggml_mul_mat):
+    //   src0 = weight     [K, N]  (F32 / Q8_0 / Q4_K)  -> result->ne[0] = N
+    //   src1 = activation [K, M]  (F32)                -> result->ne[1] = M
+    //   dst  [N, M], column-major: dst[n + m*N] = sum_k w[k + n*K] * a[k + m*K]
+    // The column-major layout matches our Bf[n*K+k] / Ab[m*K+k] / Cb[m*N+n].
+    if (!cdsp_can_mul_mat(dst)) return GGML_STATUS_FAILED;
+    struct ggml_tensor * w = dst->src[0]; // weight
+    struct ggml_tensor * a = dst->src[1]; // activation
 
-    const int64_t K = src0->ne[0];
-    const int64_t M = src0->ne[1];
-    const int64_t N = src1->ne[1];
-    const int64_t B0 = src0->ne[2] * src0->ne[3];          // activation batches
-    const int64_t B1 = src1->ne[2] * src1->ne[3];          // weight batches
-
-    if (K <= 0 || M <= 0 || N <= 0)            return GGML_STATUS_FAILED;
-    if (src0->type != GGML_TYPE_F32)           return GGML_STATUS_FAILED;
-    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_0)
-                                                return GGML_STATUS_FAILED;
-    if (B1 != 1 && B1 != B0)                   return GGML_STATUS_FAILED;
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    const int64_t M = a->ne[1];
+    const int64_t B0 = a->ne[2] * a->ne[3];          // activation batches
+    const int64_t B1 = w->ne[2] * w->ne[3];          // weight batches
 
     if (getenv("GGML_CDSP_DEBUG"))
         fprintf(stderr, "[ggml-cdsp] offloaded MUL_MAT M=%lld N=%lld K=%lld\n",
                 (long long)M, (long long)N, (long long)K);
 
-    const float  * A = (const float  *)src0->data;
-    const uint8_t * W = (const uint8_t *)src1->data;
+    if (getenv("GGML_CDSP_TRACE"))
+        fprintf(stderr,
+            "[ggml-cdsp] TRACE w(type=%d ne=[%lld,%lld,%lld,%lld] "
+            "nb=[%lld,%lld,%lld,%lld] contig=%d nbytes=%zu expect=%zu) "
+            "a(type=%d ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d) "
+            "dst(ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d)\n",
+            (int)w->type, (long long)w->ne[0], (long long)w->ne[1],
+            (long long)w->ne[2], (long long)w->ne[3],
+            (long long)w->nb[0], (long long)w->nb[1],
+            (long long)w->nb[2], (long long)w->nb[3],
+            (int)ggml_is_contiguous(w), ggml_nbytes(w),
+            (w->type == GGML_TYPE_Q4_K)
+                ? (size_t)N * (size_t)(K / 256) * sizeof(block_q4_K)
+                : (w->type == GGML_TYPE_Q8_0)
+                    ? (size_t)N * (size_t)(K / 32) * sizeof(block_q8_0)
+                    : (size_t)N * (size_t)K * sizeof(float),
+            (int)a->type, (long long)a->ne[0], (long long)a->ne[1],
+            (long long)a->ne[2], (long long)a->ne[3],
+            (long long)a->nb[0], (long long)a->nb[1],
+            (long long)a->nb[2], (long long)a->nb[3],
+            (int)ggml_is_contiguous(a),
+            (long long)dst->ne[0], (long long)dst->ne[1],
+            (long long)dst->ne[2], (long long)dst->ne[3],
+            (long long)dst->nb[0], (long long)dst->nb[1],
+            (long long)dst->nb[2], (long long)dst->nb[3],
+            (int)ggml_is_contiguous(dst));
+
+    const float   * A = (const float   *)a->data;
+    const uint8_t * W = (const uint8_t *)w->data;
     float         * C = (float         *)dst->data;
 
-    const size_t wbatch = ggml_nbytes(src1) / (size_t)(B1 > 0 ? B1 : 1);
+    const size_t wbatch = ggml_nbytes(w) / (size_t)(B1 > 0 ? B1 : 1);
 
     std::vector<int8_t>  Aq((size_t)M * K);
     std::vector<float>   sA((size_t)M);
 
     wcache_init_cap();
+    const bool no_cache = getenv("GGML_CDSP_NO_CACHE") != nullptr;
+    const bool host_f32 = getenv("GGML_CDSP_HOST_F32") != nullptr;
+
+    // ---- diagnostic mode: exact F32 GEMM on the host, no int8 / no DSP ----
+    // Uses the SAME dequant helpers as the real path. If model output is correct
+    // here but not in the normal path, the dequant/layout code is fine and the
+    // fault lies in int8 quantization, the DSP kernel, or the weight cache.
+    if (host_f32) {
+        for (int64_t b = 0; b < B0; b++) {
+            const int64_t   b1 = (B1 == 1) ? 0 : b;
+            const float   * Ab = A  + b * M * K;
+            const uint8_t * Wb = W  + b1 * wbatch;
+            float         * Cb = C  + b * M * N;
+            std::vector<float> Bf((size_t)N * K);
+            if (w->type == GGML_TYPE_F32)
+                memcpy(Bf.data(), Wb, (size_t)N * K * sizeof(float));
+            else if (w->type == GGML_TYPE_Q8_0)
+                dequant_q8_0(Wb, (int)K, (int)N, Bf.data());
+            else
+                dequant_q4_k(Wb, (int)K, (int)N, Bf.data());
+            for (int64_t m = 0; m < M; m++)
+                for (int64_t n = 0; n < N; n++) {
+                    float acc = 0.f;
+                    for (int64_t k = 0; k < K; k++)
+                        acc += Ab[(size_t)m * K + k] * Bf[(size_t)n * K + k];
+                    Cb[(size_t)m * N + n] = acc;
+                }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
 
     for (int64_t b = 0; b < B0; b++) {
         int64_t b1 = (B1 == 1) ? 0 : b;
@@ -182,16 +376,24 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
         float         * Cb  = C  + b * M * N;
 
         // ---- weight cache lookup (keyed by pointer + in-tensor batch) ----
+        // GGML_CDSP_NO_CACHE bypasses the cache entirely: upload every time,
+        // release immediately. Useful to detect STALE cache entries, i.e. a
+        // dynamic tensor that reuses the same buffer but changes its contents
+        // between forwards (e.g. quantized KV-cache slices).
         WKey key{ (const void *)Wb, b1 };
-        auto it = g_wcache.find(key);
+        auto it = no_cache ? g_wcache.end() : g_wcache.find(key);
+        CachedWeight local;
+        CachedWeight * pcw = nullptr;
         if (it == g_wcache.end()) {
             g_wcache_misses++;
-            // 1. weight Wb (N x K) -> F32 (dequant Q8_0 if needed)
+            // 1. weight Wb (N x K) -> F32 (dequant Q8_0 / Q4_K if needed)
             std::vector<float> Bf((size_t)N * K);
-            if (src1->type == GGML_TYPE_F32) {
+            if (w->type == GGML_TYPE_F32) {
                 memcpy(Bf.data(), Wb, (size_t)N * K * sizeof(float));
-            } else {
+            } else if (w->type == GGML_TYPE_Q8_0) {
                 dequant_q8_0(Wb, (int)K, (int)N, Bf.data());
+            } else {
+                dequant_q4_k(Wb, (int)K, (int)N, Bf.data());
             }
             // 2. quantize weight per column -> Bq (N x K) + sB (N scales)
             std::vector<int8_t>  Bq((size_t)N * K);
@@ -212,16 +414,23 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
             }
             const int Kblk = (K + 3) / 4, nT = (N + 31) / 32;
             size_t packed = (size_t)nT * Kblk * 128;
-            CachedWeight entry{ handle, (int)N, (int)K, std::move(sB), packed, ++g_wcache_tick };
-            wcache_evict_to_fit(packed);
-            g_wcache[key] = std::move(entry);
-            g_wcache_bytes += packed;
-            it = g_wcache.find(key);
+            local = CachedWeight{ handle, (int)N, (int)K, std::move(sB), packed,
+                                  ++g_wcache_tick };
+            if (no_cache) {
+                pcw = &local;
+            } else {
+                wcache_evict_to_fit(packed);
+                g_wcache[key] = std::move(local);
+                g_wcache_bytes += packed;
+                it = g_wcache.find(key);
+                pcw = &it->second;
+            }
         } else {
             g_wcache_hits++;
+            pcw = &it->second;
         }
-        it->second.last = ++g_wcache_tick;
-        const CachedWeight & cw = it->second;
+        pcw->last = ++g_wcache_tick;
+        const CachedWeight & cw = *pcw;
 
         // 5. quantize activation A (M x K) per row
         for (int64_t m = 0; m < M; m++)
@@ -241,6 +450,11 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
             for (int64_t n = 0; n < N; n++)
                 Cb[(size_t)m * N + n] =
                     sA[m] * cw.sB[n] * (float)C32[(size_t)m * N + n];
+
+        // In diagnostic no-cache mode `local` is a stack entry not owned by
+        // g_wcache, so release its DSP handle explicitly here (otherwise every
+        // offloaded MUL_MAT leaks one prepacked weight buffer on the cDSP).
+        if (no_cache && pcw == &local) cdsp_gemm_release(local.handle);
     }
 
     if (getenv("GGML_CDSP_DEBUG"))
@@ -345,14 +559,9 @@ static ggml_backend_buffer_type_t cdsp_dev_get_host_buffer_type(ggml_backend_dev
 }
 
 static bool cdsp_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_MUL_MAT) return false;
-    const struct ggml_tensor * a = op->src[0];
-    const struct ggml_tensor * b = op->src[1];
-    if (a == nullptr || b == nullptr) return false;
-    if (a->type != GGML_TYPE_F32) return false;
-    if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_Q8_0) return false;
-    if (a->ne[0] != b->ne[0]) return false; // contraction dim must match
-    return true;
+    // Single source of truth: must agree with cdsp_mul_mat() exactly, or the
+    // scheduler assigns us an op we reject and the whole graph fails.
+    return cdsp_can_mul_mat(op);
 }
 
 static bool cdsp_dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {

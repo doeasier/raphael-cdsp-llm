@@ -219,7 +219,75 @@ for the capacity caveat.
 
 ---
 
-## 5. Troubleshooting
+## 5. Stage 6 — HVX tuning + real llama.cpp inference
+
+### 5.1 Rebuild and deploy the tuned DSP skel
+
+`gemm_dsp.c` now contains three auto-selected HVX paths (§3.5 of
+[architecture.md](architecture.md)). Rebuild on the Windows host — **run the
+script from `src/dsp`**, QAIC resolves `gemm.idl` relative to the CWD:
+
+```bash
+cd src/dsp && bash build_win.sh && cd ../..
+# -> prebuilt/libgemm_skel.so  (7 exported T symbols, ~35 vrmpy instructions)
+```
+
+`deploy_cdsp_gemm.py` now ships `bench_cached.c`, compiles it, installs the skel
+to all cDSP search paths, restarts `cdsprpcd`, runs the 9 correctness cases and
+finally the throughput suite (with a 200-iteration warm-up to get the DSP off
+its cold clock):
+
+```bash
+python3 scripts/device/deploy_cdsp_gemm.py | tee evidence/stage6-dsp-regression.txt
+#   -> host: PASS - all ... elements verified correct.   (9 cases)
+#   -> BENCH M=128 N=512 K=512 ... 32.2 GMAC/s ... verify=PASS
+```
+
+> If you deploy the skel by hand, remember **all three** paths —
+> `/usr/lib/rfsa/cdsp`, `/usr/share/qcom/dsp/cdsp`,
+> `/data/local/tmp/cdsp_gemm` — and `systemctl restart cdsprpcd`. A stale skel in
+> one of them is a silent correctness bug (it looked exactly like "garbled model
+> output" during Stage 6 debugging).
+
+### 5.2 Rebuild the ggml backend + integration shim
+
+```bash
+python3 scripts/device/deploy_ggml_cdsp.py | tee evidence/stage6-ggml-regression.txt
+#   -> PASS / SCHED_TEST PASS / CACHE_TEST PASS
+#   -> Q4_K_TEST PASS, Q8_0_TEST PASS
+#   -> builds /data/local/tmp/ggml-backend/libggml_cdsp_preload.so
+```
+
+### 5.3 Run the real model
+
+Model must be on the phone (`/root/models/Qwen3.5-4B-Q4_K_M.gguf`, 2.55 GB;
+served from the host over HTTP + `curl -C -`, SFTP is flaky for large files).
+Full recipe in [llama-integration.md](llama-integration.md). Short version:
+
+```bash
+python3 scripts/device/llama_diag.py normal --tokens 64 --no-debug \
+    --min-elems 100000 --max-elems 3000000
+python3 scripts/device/llama_diag.py cpu --tokens 64 --no-debug
+```
+
+`llama_diag.py` modes: `normal`, `nocache`, `hostf32`, `cpu`. It saves the full
+device log to `tmp/diag_<mode>.host.log` on the host and prints a compact
+report (offload count, cache hits/misses, tokens/s, generated text).
+
+Expected: coherent `Thinking Process: ... Capital: Paris`, `errors=0`,
+~3.4–3.8 t/s generation vs ~3.6–4.1 t/s CPU. Numbers move ~10% with device
+thermals — always compare the two configurations in the same time window.
+
+> **Do not use `MAX_ELEMS=0` on a 4B model:** the 256 MB cache thrashes and the
+> run effectively hangs. Let `timeout` stop the process; if you must
+> `kill -9 llama-cli`, check `cat /sys/class/remoteproc/remoteproc1/state`
+> afterwards. A killed FastRPC client can leave the cDSP in `crashed` state —
+> sysfs `stop`/`start` does not recover it, only `systemctl reboot` (never
+> `kexec`) does. All subsequent `cdsp_gemm_open` calls then fail with `rc=-1`.
+
+---
+
+## 6. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -228,21 +296,28 @@ for the capacity caveat.
 | `test_cdsp` fails to `dlopen("cdsp")` | passing a backend name instead of a path | `ggml_backend_load()` takes a **.so path**; the test passes the full path already |
 | `undefined reference to ggml_backend_tensor_get` | only `-lggml` linked | link `-lggml -lggml-base -lggml-cpu` (build_device.sh / deploy handle this) |
 | SFTP `ENOENT` on upload | flaky SFTP subsystem on this device | `deploy_cdsp_gemm.py` uses base64-over-exec (`put_exec`); `deploy_ggml_cdsp.py` uses `put_dir` (worked for headers) |
+| `graph_compute ... -1` / `Compute error` | scheduler dispatched an op `cdsp_mul_mat()` rejected, or full offload thrashed | Stage 6 shares one `cdsp_can_mul_mat()` predicate; also set `MAX_ELEMS=3000000` |
+| Garbled / Cyrillic model output | stale `libggml-cdsp.so` or `libgemm_skel.so`, or wrong Q4_K/Q8_0 block layout | rebuild **both** (§5.1 + §5.2); Q4_K = 144 B / `scales[12]`, Q8_0 = 34 B / fp16 scale |
+| `invalid argument: -no-cnv` | 0.9.0 has no such flag | use `-st` / `--single-turn` |
+| `RC=127` | env assignments placed after `timeout` | put `LD_LIBRARY_PATH=... LD_PRELOAD=...` **before** `timeout` |
+| No `loaded cdsp backend` line | `GGML_BACKEND_PATH` alone does nothing with `GGML_BACKEND_DL=OFF` | use `LD_PRELOAD=.../libggml_cdsp_preload.so` (§5.3 / llama-integration.md) |
+| Benchmark numbers 30–50% low | cDSP DVFS cold clock | run a 200-iteration warm-up shape first (`deploy_cdsp_gemm.py` does this) |
 
 ---
 
-## 6. What is NOT done yet
+## 7. What is NOT done yet
 
-The weight-cache structural blocker is **solved** (Stage 5): weights are uploaded
-once and reused. What remains before real llama.cpp inference is genuinely useful:
+Stages 0–6 are implemented and verified. Remaining work, in priority order
+(full rationale in [next-steps.md](next-steps.md) §4):
 
-- **HVX peak tuning** — effective compute is still only ~4 GMAC/s vs the V66 HVX
-  ceiling (~150–200 GMAC/s). The prepack is already out of the hot path; closing
-  this gap is now the dominant lever (see [docs/next-steps.md](next-steps.md) §2).
-- **cDSP memory capacity** — the weight cache holds the model as int8 on the DSP.
-  A 4B model is ~4 GB int8, far more than the cDSP can hold, so the 256 MB default
-  cache will thrash for such models. Small models, or a larger cache on devices
-  with more DSP RAM, avoid this. Real end-to-end inference still needs to be run
-  and measured (§3 of next-steps.md).
-- Only `GGML_OP_MUL_MAT` is offloaded; all other ops run on the CPU. By design for
-  this PoC.
+- **Batch RPC calls.** One FastRPC round-trip per `MUL_MAT` (~50–60/token,
+  ~0.25 ms each measured for a 128-MAC ping) is now the dominant cost.
+- **Weight staging for large models.** The 256 MB cache cannot hold a 4B model
+  as int8, so only small/medium matrices are offloaded; the large FFN GEMMs
+  stay on the CPU. Streaming tiles from AP memory is the next structural step.
+- **Small-model benchmark.** A model whose int8 weights fit the cache is where
+  the backend should actually beat the CPU; not yet measured.
+- **Fuse the output rescale** on the DSP, and use better-than-per-vector int8
+  quantization (currently ~0.4–0.7% relative error per layer).
+- Only `GGML_OP_MUL_MAT` is offloaded; all other ops run on the CPU. By design
+  for this PoC.

@@ -54,6 +54,8 @@ typedef struct {
 static wcache_t g_wcache[WCACHE_MAX];
 static int32_t  g_wh_next = 1;   /* 0 reserved as "invalid"              */
 
+static void aw_release(void);    /* defined below, used by cdsp_gemm_close */
+
 /* ---- per-session open/close (DSP side) ---------------------------------- */
 int __QAIC_HEADER(cdsp_gemm_open)(const char* uri, remote_handle64* handle) {
     (void)uri;
@@ -70,6 +72,7 @@ int __QAIC_HEADER(cdsp_gemm_close)(remote_handle64 handle) {
         g_wcache[i].bp = NULL;
         g_wcache[i].handle = 0; g_wcache[i].N = 0; g_wcache[i].K = 0;
     }
+    aw_release();   /* free the persistent packed-A scratch buffer */
     if (handle) free((void*)(uintptr_t)handle);
     return 0;
 }
@@ -116,7 +119,148 @@ static int8_t * prepack_B(const int8_t * B, int N, int K, void ** raw_out) {
     return Bp;
 }
 
-/* ---- HVX compute using an already-prepacked Bp (the hot path) ------------ */
+/* ---- HVX compute using an already-prepacked Bp (the hot path) ------------
+ * Stage 6 / §2 HVX tuning. The kernel auto-selects one of three paths:
+ *
+ *   M == 1                 -> gemm_m1()       : decode, 4-way K unroll
+ *   M >  1, Bp <= 512 KB  -> gemm_small_bp() : L2-resident weights, 1 acc
+ *   M >  1, Bp >  512 KB  -> M-blocked loop  : prompt batch, amortized Bp
+ *
+ * Optimizations applied to the original naive M-t-kb loop:
+ *
+ *  1. HOIST A. The original code re-read and re-packed the four A bytes for
+ *     every (m, tile, kb). A is tiny compared to Bp but the scalar loads were
+ *     in the innermost loop, on the dependency chain of `vsplat`. We now pack
+ *     one uint32 word per (row, k-block) ONCE per row block and reuse it for
+ *     all N tiles -> M*nTiles*Kblk scalar loads become M*Kblk.
+ *  2. M-BLOCKING. Bp is a streamed, read-once operand for M=1 decode, but for
+ *     prompt batches (M>1) the naive loop streamed the whole Bp tile M times.
+ *     Processing M_BLOCK rows together loads each 128-byte Bp vector once and
+ *     reuses it across rows, cutting weight traffic by up to M_BLOCK.
+ *  3. K-UNROLL (M==1 ONLY). `vrmpyacc` accumulates in place, so a single Vacc
+ *     forms a serial dependency chain across all Kblk iterations. For decode
+ *     (one row) four independent accumulators let four Bp loads be in flight.
+ *     For M>1 the M_BLOCK rows already provide that ILP, and extra accumulator
+ *     planes only caused register spills on V66, so that path uses K_UNROLL=1.
+ *
+ * Register budget on V66 (32 x 128B HVX regs):
+ *   M==1 : 4 accumulators + 4 loaded B vectors + one splat = 9
+ *   M>1  : M_BLOCK accumulators + one B vector + one splat = M_BLOCK + 2
+ * ----------------------------------------------------------------------- */
+#define M_BLOCK  4
+#define K_UNROLL 2
+/* When the whole prepacked weight fits in L2, streaming it once per (m,t)
+ * is cheap and the original m-major loop (1 accumulator) beats M-blocking:
+ * measured 13.6 vs 10.7 GMAC/s at 128x512x512. Above this size the redundant
+ * M-fold weight traffic dominates and M-blocking wins by 3-4x. */
+#define SMALL_BP_BYTES (512 * 1024)
+
+/* Scratch buffer for packed A words, allocated once per PD (NOT per GEMM).
+ * A malloc/free inside the HVX lock measurably showed up in the M=1 decode
+ * microbenchmark, so the buffer is grown on demand and released in close(). */
+static uint32_t *g_aw = NULL;
+static size_t    g_aw_words = 0;
+
+static uint32_t * aw_ensure(size_t words) {
+    if (words <= g_aw_words && g_aw != NULL) return g_aw;
+    uint32_t *p = (uint32_t *)malloc(words * sizeof(uint32_t));
+    if (p == NULL) return NULL;
+    if (g_aw) free(g_aw);
+    g_aw = p;
+    g_aw_words = words;
+    return p;
+}
+
+static void aw_release(void) {
+    if (g_aw) { free(g_aw); g_aw = NULL; g_aw_words = 0; }
+}
+
+/* Pack one row of A into one uint32 per k-block (4 int8 lanes for vrmpy).
+ * Bytes beyond K are zero, matching prepack_B()'s zero padding. */
+static inline void pack_a_row(const int8_t * Ar, int K, int Kblk, uint32_t * wr) {
+    for (int kb = 0; kb < Kblk; kb++) {
+        const int k0 = kb * K_STEP;
+        uint32_t w = 0;
+        for (int i = 0; i < K_STEP; i++) {
+            const int kk = k0 + i;
+            uint32_t b = (kk < K) ? (uint32_t)(uint8_t)Ar[kk] : 0u;
+            w |= b << (8 * i);
+        }
+        wr[kb] = w;
+    }
+}
+
+static inline const HVX_Vector * tile_ptr(const int8_t * Bp, int t, int Kblk) {
+    return (const HVX_Vector *)(Bp +
+           (size_t)t * (size_t)Kblk * HVX_VECTOR_BYTES);
+}
+
+/* ---- M == 1 decode path -------------------------------------------------
+ * Decode is bandwidth-bound: one 128-byte Bp load feeds exactly 128 MACs and
+ * is never reused. Four independent accumulators let four Bp loads be in
+ * flight at once, hiding DDR latency; the four partial sums are added once
+ * at the end. Kept separate from the M>1 path because a shared [M_BLOCK]
+ * accumulator array spills to the stack when rows == 1 (measured: 1.4x
+ * SLOWER than the single-accumulator loop on this V66).
+ * ----------------------------------------------------------------------- */
+static void gemm_m1(const int8_t * A, int N, int K, int Kblk, int nTiles,
+                    const int8_t * Bp, int32_t * C, uint32_t * aw,
+                    int32_t * accbuf) {
+    pack_a_row(A, K, Kblk, aw);
+
+    for (int t = 0; t < nTiles; t++) {
+        const int c0   = t * N_TILE;
+        const int cols = (c0 + N_TILE <= N) ? N_TILE : (N - c0);
+        const HVX_Vector *vb = tile_ptr(Bp, t, Kblk);
+
+        HVX_Vector v0 = Q6_V_vsplat_R(0), v1 = Q6_V_vsplat_R(0);
+        HVX_Vector v2 = Q6_V_vsplat_R(0), v3 = Q6_V_vsplat_R(0);
+        int kb = 0;
+        for (; kb + 4 <= Kblk; kb += 4) {
+            HVX_Vector b0 = vb[kb + 0], b1 = vb[kb + 1];
+            HVX_Vector b2 = vb[kb + 2], b3 = vb[kb + 3];
+            v0 = Q6_Vw_vrmpyacc_VwVbVb(v0, Q6_V_vsplat_R(aw[kb + 0]), b0);
+            v1 = Q6_Vw_vrmpyacc_VwVbVb(v1, Q6_V_vsplat_R(aw[kb + 1]), b1);
+            v2 = Q6_Vw_vrmpyacc_VwVbVb(v2, Q6_V_vsplat_R(aw[kb + 2]), b2);
+            v3 = Q6_Vw_vrmpyacc_VwVbVb(v3, Q6_V_vsplat_R(aw[kb + 3]), b3);
+        }
+        for (; kb < Kblk; kb++) {
+            v0 = Q6_Vw_vrmpyacc_VwVbVb(v0, Q6_V_vsplat_R(aw[kb]), vb[kb]);
+        }
+        HVX_Vector v = Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(v0, v1),
+                                       Q6_Vw_vadd_VwVw(v2, v3));
+        *(HVX_Vector *)accbuf = v;
+        for (int j = 0; j < cols; j++) C[c0 + j] = accbuf[j];
+    }
+}
+
+/* ---- M>1, Bp fits in L2: one accumulator, m-major ------------------------
+ * Small square-ish GEMMs (the original HVX benchmark shape) are compute-bound
+ * once Bp is L2-resident. A single accumulator keeps register pressure minimal
+ * and the m-major order lets each Bp tile stay hot across all k-blocks.
+ * ----------------------------------------------------------------------- */
+static void gemm_small_bp(const int8_t * A, int M, int N, int K,
+                          int Kblk, int nTiles, const int8_t * Bp,
+                          int32_t * C, uint32_t * aw, int32_t * accbuf) {
+    for (int m = 0; m < M; m++)
+        pack_a_row(A + (size_t)m * K, K, Kblk, aw + (size_t)m * Kblk);
+
+    for (int m = 0; m < M; m++) {
+        int32_t *Cr = C + (size_t)m * N;
+        for (int t = 0; t < nTiles; t++) {
+            const HVX_Vector *vb = tile_ptr(Bp, t, Kblk);
+            HVX_Vector Vacc = Q6_V_vsplat_R(0);
+            for (int kb = 0; kb < Kblk; kb++)
+                Vacc = Q6_Vw_vrmpyacc_VwVbVb(
+                    Vacc, Q6_V_vsplat_R(aw[(size_t)m * Kblk + kb]), vb[kb]);
+            *(HVX_Vector *)accbuf = Vacc;
+            const int c0   = t * N_TILE;
+            const int cols = (c0 + N_TILE <= N) ? N_TILE : (N - c0);
+            for (int j = 0; j < cols; j++) Cr[c0 + j] = accbuf[j];
+        }
+    }
+}
+
 static int gemm_compute_with_bp(remote_handle64 _h,
                                 const int8_t * A, int M, int N, int K,
                                 const int8_t * Bp, int32_t * C) {
@@ -125,47 +269,78 @@ static int gemm_compute_with_bp(remote_handle64 _h,
     const int Kblk   = (K + K_STEP - 1) / K_STEP;
     const int nTiles = (N + N_TILE - 1) / N_TILE;
 
-    /* Lock the 128-byte HVX unit. The compiler may emit HVX for any hot loop
-     * under -mhvx, and executing HVX outside the lock faults, so wrap the
-     * entire compute. */
+    const size_t bp_bytes = (size_t)nTiles * (size_t)Kblk * HVX_VECTOR_BYTES;
+    const int    small_bp = (M > 1) && (bp_bytes <= SMALL_BP_BYTES);
+
+    /* Grow the persistent scratch buffer BEFORE taking the HVX lock. */
+    const size_t aw_words = (M == 1) ? (size_t)Kblk
+                          : small_bp ? (size_t)M * (size_t)Kblk
+                                     : (size_t)M_BLOCK * (size_t)Kblk;
+    uint32_t * aw = aw_ensure(aw_words);
+    if (aw == NULL) return -21;
+
     int rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
     if (rc != QURT_EOK) return -20;
 
     static int32_t accbuf[32] __attribute__((aligned(HVX_VECTOR_BYTES)));
 
-    for (int m = 0; m < M; m++) {
-        const int8_t *Ar = A + (size_t)m * K;
-        int32_t      *Cr = C + (size_t)m * N;
+    if (M == 1) {
+        gemm_m1(A, N, K, Kblk, nTiles, Bp, C, aw, accbuf);
+        qurt_hvx_unlock();
+        return 0;
+    }
+    if (small_bp) {
+        gemm_small_bp(A, M, N, K, Kblk, nTiles, Bp, C, aw, accbuf);
+        qurt_hvx_unlock();
+        return 0;
+    }
 
-        for (int t = 0; t < nTiles; t++) {
-            const int c0  = t * N_TILE;
-            const int cols = (c0 + N_TILE <= N) ? N_TILE : (N - c0);
+    for (int t = 0; t < nTiles; t++) {
+        const int c0   = t * N_TILE;
+        const int cols = (c0 + N_TILE <= N) ? N_TILE : (N - c0);
+        const HVX_Vector *vb = tile_ptr(Bp, t, Kblk);
 
-            HVX_Vector Vacc = Q6_V_vsplat_R(0);   /* zero accumulator */
+        for (int mb = 0; mb < M; mb += M_BLOCK) {
+            const int rows = (mb + M_BLOCK <= M) ? M_BLOCK : (M - mb);
 
-            for (int kb = 0; kb < Kblk; kb++) {
-                const int k0 = kb * K_STEP;
+            /* (1) pack A once for this row block, reused across all tiles */
+            for (int r = 0; r < rows; r++)
+                pack_a_row(A + (size_t)(mb + r) * K, K, Kblk,
+                           aw + (size_t)r * Kblk);
 
-                uint8_t a[4];
-                for (int i = 0; i < K_STEP; i++) {
-                    const int kk = k0 + i;
-                    const int8_t v = (kk < K) ? Ar[kk] : 0;
-                    a[i] = (uint8_t)v;            /* 2's-complement byte */
+            /* (3) K_UNROLL independent accumulator chains */
+            HVX_Vector Vacc[M_BLOCK][K_UNROLL];
+            for (int r = 0; r < rows; r++)
+                for (int u = 0; u < K_UNROLL; u++)
+                    Vacc[r][u] = Q6_V_vsplat_R(0);
+
+            int kb = 0;
+            for (; kb + K_UNROLL <= Kblk; kb += K_UNROLL) {
+                HVX_Vector bu[K_UNROLL];
+                for (int u = 0; u < K_UNROLL; u++) bu[u] = vb[kb + u];
+                /* (2) the same Bp vector feeds M_BLOCK rows */
+                for (int r = 0; r < rows; r++) {
+                    for (int u = 0; u < K_UNROLL; u++) {
+                        HVX_Vector va = Q6_V_vsplat_R(aw[(size_t)r * Kblk + kb + u]);
+                        Vacc[r][u] = Q6_Vw_vrmpyacc_VwVbVb(Vacc[r][u], va, bu[u]);
+                    }
                 }
-                const uint32_t aw = (uint32_t)a[0]
-                                  | ((uint32_t)a[1] << 8)
-                                  | ((uint32_t)a[2] << 16)
-                                  | ((uint32_t)a[3] << 24);
-                const HVX_Vector va = Q6_V_vsplat_R(aw);
-
-                const HVX_Vector vb =
-                    *(const HVX_Vector*)(Bp + ((size_t)t * Kblk + kb) * HVX_VECTOR_BYTES);
-
-                Vacc = Q6_Vw_vrmpyacc_VwVbVb(Vacc, va, vb);
+            }
+            for (; kb < Kblk; kb++) {   /* odd Kblk tail */
+                for (int r = 0; r < rows; r++) {
+                    HVX_Vector va = Q6_V_vsplat_R(aw[(size_t)r * Kblk + kb]);
+                    Vacc[r][0] = Q6_Vw_vrmpyacc_VwVbVb(Vacc[r][0], va, vb[kb]);
+                }
             }
 
-            *(HVX_Vector*)accbuf = Vacc;
-            for (int j = 0; j < cols; j++) Cr[c0 + j] = accbuf[j];
+            for (int r = 0; r < rows; r++) {
+                HVX_Vector v = Vacc[r][0];
+                for (int u = 1; u < K_UNROLL; u++)
+                    v = Q6_Vw_vadd_VwVw(v, Vacc[r][u]);
+                *(HVX_Vector *)accbuf = v;
+                int32_t *Cr = C + (size_t)(mb + r) * N;
+                for (int j = 0; j < cols; j++) Cr[c0 + j] = accbuf[j];
+            }
         }
     }
 

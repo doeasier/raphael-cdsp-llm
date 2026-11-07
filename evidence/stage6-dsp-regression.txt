@@ -1,0 +1,86 @@
+[*] connected to device
+[+] put host_test.c
+[+] put host_test_cached.c
+[+] put bench_cached.c
+[+] put gen/gemm.h
+[+] put gen/cdsp_gemm_stub.c
+[+] put AEEStdDef.h
+[+] put AEEStdErr.h
+[+] put libgemm_skel.so
+--- compile ---
+
+
+=== host_test (one-shot) 32x128x128 (rc=0) ===
+host: cDSP session open, handle=187651841520960
+host: gemm_int8 done (M=32 N=128 K=128) in 0.55 ms
+host: PASS - all 4096 elements verified correct.
+
+
+=== host_test (one-shot) 64x256x256 (rc=0) ===
+host: cDSP session open, handle=187650825553216
+host: gemm_int8 done (M=64 N=256 K=256) in 1.48 ms
+host: PASS - all 16384 elements verified correct.
+
+
+=== host_test (one-shot) 128x512x512 (rc=0) ===
+host: cDSP session open, handle=187651974321472
+host: gemm_int8 done (M=128 N=512 K=512) in 3.85 ms
+host: PASS - all 65536 elements verified correct.
+
+
+=== host_test_cached (weight-cache) 32x128x128 (rc=0) ===
+host: cDSP session open, handle=187650765497728
+host: gemm_upload done -> weight handle=1 in 0.61 ms
+host: gemm_compute_cached done (M=32 N=128 K=128) in 0.44 ms
+host: PASS - all 4096 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 64x256x256 (rc=0) ===
+host: cDSP session open, handle=187651413173632
+host: gemm_upload done -> weight handle=1 in 0.68 ms
+host: gemm_compute_cached done (M=64 N=256 K=256) in 0.77 ms
+host: PASS - all 16384 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 128x512x512 (rc=0) ===
+host: cDSP session open, handle=187650487412096
+host: gemm_upload done -> weight handle=1 in 2.36 ms
+host: gemm_compute_cached done (M=128 N=512 K=512) in 2.78 ms
+host: PASS - all 65536 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 1x4096x4096 (rc=0) ===
+host: cDSP session open, handle=187651757622656
+host: gemm_upload done -> weight handle=1 in 251.23 ms
+host: gemm_compute_cached done (M=1 N=4096 K=4096) in 8.20 ms
+host: PASS - all 4096 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 1x11008x4096 (rc=0) ===
+host: cDSP session open, handle=187650774320512
+host: gemm_upload done -> weight handle=1 in 676.90 ms
+host: gemm_compute_cached done (M=1 N=11008 K=4096) in 23.87 ms
+host: PASS - all 11008 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 32x4096x4096 (rc=0) ===
+host: cDSP session open, handle=187651835254144
+host: gemm_upload done -> weight handle=1 in 250.27 ms
+host: gemm_compute_cached done (M=32 N=4096 K=4096) in 94.18 ms
+host: PASS - all 131072 elements verified correct.
+host: gemm_release rc=0
+
+
+=== bench_cached (Stage 6 HVX throughput) ===
+[warm-up] BENCH M=128 N=512 K=512 iters=200 | upload=2.13 ms | compute=2.0851 ms/call | 32.19 GMAC/s | verify[0,511]=PASS
+BENCH M=1 N=32 K=4 iters=100 | upload=0.27 ms | compute=0.3398 ms/call | 0.00 GMAC/s | verify[0,31]=PASS
+BENCH M=1 N=32 K=2560 iters=100 | upload=0.71 ms | compute=0.3481 ms/call | 0.47 GMAC/s | verify[0,31]=PASS
+BENCH M=1 N=1024 K=2560 iters=60 | upload=47.40 ms | compute=1.7426 ms/call | 3.01 GMAC/s | verify[0,1023]=PASS
+BENCH M=1 N=4096 K=4096 iters=25 | upload=250.81 ms | compute=9.2042 ms/call | 3.65 GMAC/s | verify[0,4095]=PASS
+BENCH M=128 N=512 K=512 iters=30 | upload=2.20 ms | compute=2.1879 ms/call | 30.67 GMAC/s | verify[0,511]=PASS
+BENCH M=32 N=4096 K=4096 iters=12 | upload=253.47 ms | compute=94.2803 ms/call | 11.39 GMAC/s | verify[0,4095]=PASS

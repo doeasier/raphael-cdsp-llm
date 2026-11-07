@@ -110,10 +110,10 @@ int main() {
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) { fprintf(stderr, "FAIL: ggml_init\n"); return 1; }
 
-    // ne[0]=K (contraction), ne[1]=rows/cols
-    ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
-    ggml_tensor * B  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
-    ggml_tensor * mm = ggml_mul_mat(ctx, A, B);   // result ne[0]=N, ne[1]=M
+    // ggml_mul_mat(src0=weight, src1=activation): result ne[0]=N, ne[1]=M
+    ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); // activation [K,M]
+    ggml_tensor * B  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N); // weight     [K,N]
+    ggml_tensor * mm = ggml_mul_mat(ctx, B, A);
     ggml_set_name(mm, "mulmat");
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
