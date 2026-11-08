@@ -1,0 +1,63 @@
+# llama-cdsp.service
+#
+# llama.cpp 0.9.0 llama-server with the out-of-tree ggml-cdsp ACCEL backend
+# (project: raphael-cdsp-llm) attached at runtime via LD_PRELOAD.
+#
+# INSTALLED AS: /etc/systemd/system/llama-cdsp.service
+# TUNABLES:     /etc/default/llama-cdsp   (see llama-cdsp.env)
+#
+# The stock binary is NOT recompiled. cDSP is attached by injecting
+# libggml_cdsp_preload.so, whose ELF constructor calls ggml_backend_load()
+# on libggml-cdsp.so. This is required because the device build has
+# GGML_BACKEND_DL=OFF, so GGML_BACKEND_PATH / GGML_BACKEND_DIR do nothing.
+#
+# Companion service llama-4b.service (port 8081, pure CPU) is NEVER touched.
+# This unit listens on LLAMA_PORT (8082 by default) so both can run at once.
+#
+# Deploy: python3 scripts/device/deploy_llama_cdsp.py
+
+[Unit]
+Description=llama.cpp 0.9.0 LLM server with cDSP ACCEL backend (raphael-cdsp-llm)
+After=network-online.target local-fs.target cdsprpcd.service
+Wants=network-online.target cdsprpcd.service
+# A crashed cDSP (watchdog / remoteproc1: crashed) is NOT recoverable by
+# restarting this service -- it needs a full `systemctl reboot`. Stop after
+# 3 failed starts instead of spinning forever, so the failure stays visible.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/root/llama.cpp-0.9.0
+
+# ---- Tunables: defaults, overridable from /etc/default/llama-cdsp ----
+Environment=LLAMA_MODEL=/root/models/Qwen3.5-4B-Q4_K_M.gguf
+Environment=LLAMA_CTX=8192
+Environment=LLAMA_SLOTS=1
+Environment=LLAMA_THREADS=8
+Environment=LLAMA_HOST=0.0.0.0
+Environment=LLAMA_PORT=8082
+Environment=GGML_CDSP_MIN_ELEMS=100000
+Environment=GGML_CDSP_MAX_ELEMS=3000000
+
+EnvironmentFile=-/etc/default/llama-cdsp
+
+# ---- Non-overridable: these three are what actually attach the cDSP ----
+# Written AFTER EnvironmentFile on purpose: a stray LD_PRELOAD= in the env
+# file must not silently turn this back into a CPU-only service.
+Environment=LD_LIBRARY_PATH=/root/llama.cpp-0.9.0/build/bin:/usr/local/lib
+Environment=LD_PRELOAD=/data/local/tmp/ggml-backend/libggml_cdsp_preload.so
+Environment=GGML_CDSP_BACKEND_PATH=/data/local/tmp/ggml-backend/libggml-cdsp.so
+
+ExecStart=/root/llama.cpp-0.9.0/build/bin/llama-server -m ${LLAMA_MODEL} -c ${LLAMA_CTX} -np ${LLAMA_SLOTS} -t ${LLAMA_THREADS} --host ${LLAMA_HOST} --port ${LLAMA_PORT} --path /root/webui --reasoning off --op-offload
+
+Restart=on-failure
+RestartSec=10
+User=root
+OOMScoreAdjust=-100
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-cdsp
+
+[Install]
+WantedBy=multi-user.target

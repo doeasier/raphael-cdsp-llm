@@ -1,0 +1,193 @@
+================================================================================
+Stage 10 - llama-cdsp.service application smoke test (2026-11-08, 19:44-19:55 CST)
+Device: Redmi K20 Pro (raphael), Ubuntu 24.04, USB-NCM root@172.16.42.1
+No reboot, no firmware/DTB change, llama-4b.service (8081) untouched.
+================================================================================
+
+[1] Baseline: the existing service is CPU-only
+--------------------------------------------------------------------------------
+$ ps -eo pid,ppid,user,etime,args | grep llama
+ 1275 1 root 01:48:58 /root/llama.cpp-0.9.0/build/bin/llama-server -m
+      /root/models/Qwen3.5-4B-Q4_K_M.gguf -c 8192 --host 0.0.0.0 --port 8081
+      --path /root/webui --reasoning off
+
+$ systemctl show llama-4b.service -p Environment -p ExecStart
+Environment=
+ExecStart={ ... llama-server ... --port 8081 ... }
+
+$ tr '\0' '\n' < /proc/1275/environ | grep -iE 'LD_PRELOAD|GGML_CDSP|ADSP_LIBRARY|DSP'
+(none)
+$ cat /etc/ld.so.preload
+(absent)
+$ grep -iE 'cdsp|ggml|preload|fastrpc|gemm' /proc/1275/maps | awk '{print $6}' | sort -u
+/root/llama.cpp-0.9.0/build/bin/libggml-base.so.0.29.0
+/root/llama.cpp-0.9.0/build/bin/libggml-cpu.so.0.29.0
+/root/llama.cpp-0.9.0/build/bin/libggml.so.0.29.0
+$ grep -iE 'GGML_HEXAGON|GGML_BACKEND_DL' build/CMakeCache.txt
+GGML_BACKEND_DL:BOOL=OFF
+GGML_HEXAGON:BOOL=OFF
+
+But the cDSP artifacts ARE present on the device (deployed at 17:44, after the
+service started at 17:39):
+$ ls -l /data/local/tmp/ggml-backend/
+-rwxr-xr-x 1 root root  69960 11月  8 17:44 libggml_cdsp_preload.so
+-rwxr-xr-x 1 root root 278760 11月  8 17:44 libggml-cdsp.so
+$ ls -l /usr/lib/rfsa/cdsp/libgemm_skel.so
+-rw-r--r-- 1 root root 22240 11月  8 17:43 libgemm_skel.so
+$ cat /sys/class/remoteproc/remoteproc1/state
+running
+$ systemctl cat cdsprpcd | grep ADSP_LIBRARY_PATH
+Environment="ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp;/usr/lib/rfsa/cdsp;/usr/share/qcom/dsp/cdsp;/data/local/tmp/hvx"
+
+[2] Backend registers as an ACCEL device (pre-install probe)
+--------------------------------------------------------------------------------
+$ cd /root/llama.cpp-0.9.0 && \
+  LD_LIBRARY_PATH=/root/llama.cpp-0.9.0/build/bin:/usr/local/lib \
+  LD_PRELOAD=/data/local/tmp/ggml-backend/libggml_cdsp_preload.so \
+  GGML_CDSP_BACKEND_PATH=/data/local/tmp/ggml-backend/libggml-cdsp.so \
+  ./build/bin/llama-server --list-devices
+load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+Available devices:
+  cdsp: Redmi K20 Pro cDSP (Hexagon 690) (0 MiB, 0 MiB free)
+RC=0
+
+[3] deploy_llama_cdsp.py precheck (all OK)
+--------------------------------------------------------------------------------
+[OK] llama-server binary                    present
+[OK] preload shim                           present
+[OK] cDSP backend plugin                    present
+[OK] DSP skel on search path                present
+[OK] cdsprpcd active                        active
+[OK] cdsp remoteproc running                running
+[OK] backend registers as ACCEL device      ... registered cDSP backend ...
+[OK] port 8082 free                         free
+[OK] CPU reference service intact           active
+UNIT_OK / ENV_OK / START_ISSUED / health: READY last=200
+
+$ systemctl status llama-cdsp --no-pager
+● llama-cdsp.service - llama.cpp 0.9.0 LLM server with cDSP ACCEL backend
+     Loaded: loaded (/etc/systemd/system/llama-cdsp.service; disabled; preset: enabled)
+     Active: active (running) since Sun 2026-11-08 19:44:03 CST
+   Main PID: 350265 (llama-server)
+   CGroup: ... /root/llama.cpp-0.9.0/build/bin/llama-server -m
+           /root/models/Qwen3.5-4B-Q4_K_M.gguf -c 8192 -np 1 -t 8
+           --host 0.0.0.0 --port 8082 --path /root/webui
+           --reasoning off --op-offload
+
+$ pid=$(systemctl show -p MainPID --value llama-cdsp); \
+  grep -iE 'cdsp|adsprpc|gemm' /proc/$pid/maps | awk '{print $6}' | sort -u
+/data/local/tmp/ggml-backend/libggml_cdsp_preload.so
+/data/local/tmp/ggml-backend/libggml-cdsp.so
+/usr/local/lib/libadsprpc.so.1.0.0
+
+$ journalctl -u llama-cdsp -o cat | grep -E 'registered|Successfully opened|listening'
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+fastrpc_apps_user.c:1844: remote_handle64_open: Successfully opened handle
+  ... for file:///libgemm_skel.so?cdsp_gemm_skel_handle_invoke&_modver=1.0&_dom=cdsp
+  on domain 3 (spawn time 22305 us, load time 14839 us), num handles 1
+... I srv  server_on_li: listening on http://0.0.0.0:8082
+
+NOTE: startup also contains "open_device_node failed for domain ID 0
+... /dev/fastrpc-adsp-secure" and "apps_std_FILE_get" errors. These are probes
+of the ADSP domain, disabled in the stage-2 DTB; the CDSP domain (3) opened OK.
+
+$ ss -lntp | grep -E ':808[0-9]'
+LISTEN 0 512 0.0.0.0:8081 ... users:(("llama-server",pid=1275,fd=3))
+LISTEN 0 512 0.0.0.0:8082 ... users:(("llama-server",pid=350265,fd=5))
+$ cat /sys/class/remoteproc/remoteproc1/state
+running
+
+[4] First real generation (default config, no DEBUG)
+--------------------------------------------------------------------------------
+$ curl -s http://127.0.0.1:8082/completion -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital of France is","n_predict":16,"temperature":0,
+       "seed":42,"stream":false}'
+content: " Paris.\nA. True\nB. False\nAnswer:\nA\n\n"
+tokens_predicted: 16
+timings.predicted_per_second: 3.331903576487512
+timings.prompt_per_second:   4.696440849266792
+remoteproc1: running
+
+[5] Hard proof of offload (temporary GGML_CDSP_DEBUG=1 drop-in)
+--------------------------------------------------------------------------------
+$ printf '[Service]\nEnvironment=GGML_CDSP_DEBUG=1\n' \
+    > /etc/systemd/system/llama-cdsp.service.d/10-debug.conf
+$ systemctl daemon-reload && systemctl restart llama-cdsp   # health READY
+
+$ journalctl -u llama-cdsp -o cat | grep -c 'offloaded MUL_MAT'
+22          # BEFORE the request (warmup / prompt eval)
+
+$ curl -s ... -d '{"prompt":"The capital of France is","n_predict":4,...}'
+CONTENT= ' Paris.\nA'
+TOKENS= 4   T/S= 2.92
+
+$ journalctl -u llama-cdsp -o cat | grep -c 'offloaded MUL_MAT'
+77          # AFTER: +55 offloaded MUL_MAT for 4 tokens
+$ journalctl -u llama-cdsp -o cat | grep 'offloaded MUL_MAT' | tail -6
+[ggml-cdsp] offloaded MUL_MAT M=1 N=1024 K=2560   (x6)
+$ journalctl -u llama-cdsp -o cat | grep 'cache hits=' | tail -2
+[ggml-cdsp] MUL_MAT M=1 N=1024 K=2560 cache hits=65 misses=11 bytes=28835840
+[ggml-cdsp] MUL_MAT M=1 N=1024 K=2560 cache hits=66 misses=11 bytes=28835840
+$ cat /sys/class/remoteproc/remoteproc1/state
+running
+
+The 4-token prefix ' Paris.\nA' matches the 16-token run in [4] exactly.
+
+[6] Restore default config (DEBUG drop-in removed)
+--------------------------------------------------------------------------------
+$ mv /etc/systemd/system/llama-cdsp.service.d/10-debug.conf \
+     /root/llama-cdsp-debug.conf.bak
+$ systemctl daemon-reload && systemctl restart llama-cdsp   # health READY
+$ systemctl cat llama-cdsp | grep GGML_CDSP_DEBUG
+(no match)
+$ tr '\0' '\n' < /proc/$pid/environ | grep -E 'LD_PRELOAD|GGML_CDSP|LD_LIBRARY' | sort
+GGML_CDSP_BACKEND_PATH=/data/local/tmp/ggml-backend/libggml-cdsp.so
+GGML_CDSP_MAX_ELEMS=3000000
+GGML_CDSP_MIN_ELEMS=100000
+LD_LIBRARY_PATH=/root/llama.cpp-0.9.0/build/bin:/usr/local/lib
+LD_PRELOAD=/data/local/tmp/ggml-backend/libggml_cdsp_preload.so
+$ systemctl is-active llama-cdsp ; systemctl is-active llama-4b.service
+active
+active
+$ cat /sys/class/remoteproc/remoteproc1/state
+running
+
+[7] A/B smoke test (llama_cdsp_smoke.py --tokens 24, both services live)
+--------------------------------------------------------------------------------
+cDSP remoteproc before: running
+--- port 8081 (health=200) ---
+  output: ' Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is'
+  decode: 24 tokens  3.57 t/s   | prompt 5.95 t/s
+  cDSP remoteproc after: running
+--- port 8082 (health=200) ---
+  output: ' Paris.\nA. True\nB. False\nAnswer:\nA\n\nWhich of the following is NOT a characteristic'
+  decode: 24 tokens  3.19 t/s   | prompt 4.67 t/s
+  cDSP remoteproc after: running
+cDSP / CPU decode ratio: 89.4%
+outputs identical: False
+
+Interpretation: consistent with Stage 6 (~94% of CPU). Not a rigorous
+benchmark - both services contend for 8 cores and Stage 7 showed a strong
+"first run is faster" thermal bias. Output divergence is the known int8
+quantization error (Stage 8), not a service fault.
+
+[8] PC-side reachability (host Windows, USB-NCM)
+--------------------------------------------------------------------------------
+$ curl -s -o /dev/null -w '%{http_code}\n' http://172.16.42.1:8082/health
+200
+$ curl -s -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://172.16.42.1:8082/
+200 7482 bytes                 # WebUI index
+$ curl -s -o /dev/null -w '%{http_code}\n' http://172.16.42.1:8081/health
+200                            # CPU reference unaffected
+================================================================================
+Files added in this stage:
+  scripts/device/llama-cdsp.service        (unit template)
+  scripts/device/llama-cdsp.env            (EnvironmentFile template)
+  scripts/device/deploy_llama_cdsp.py      (precheck + install + start + status)
+  scripts/device/llama_cdsp_smoke.py       (A/B HTTP smoke test)
+  docs/llama-cdsp-service.md               (usage, tuning, troubleshooting)
+Installed on device:
+  /etc/systemd/system/llama-cdsp.service
+  /etc/default/llama-cdsp
+================================================================================

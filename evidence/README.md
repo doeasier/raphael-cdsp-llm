@@ -1,4 +1,4 @@
-# Verification evidence (Stage 6 + Stage 7 + Stage 8 + Stage 9)
+# Verification evidence (Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10)
 
 Raw output captured on the Redmi K20 Pro over USB-NCM. Stage 7/8 use the
 final `libgemm_skel.so` (three-path HVX kernel **plus batched compute**, md5
@@ -15,6 +15,19 @@ final `libgemm_skel.so` (three-path HVX kernel **plus batched compute**, md5
 | `stage8-ggml-regression.txt` | `python3 scripts/device/deploy_ggml_cdsp.py` | **5/5 PASS** with the `GGML_CDSP_PROFILE` backend, all previous tests still green |
 | `stage8/` | `llama_diag.py --model smollm2-135m-q4_k_m.gguf` | small-model CPU/cDSP timing, greedy + sampled correctness, PROFILE/SPLIT_STATS logs |
 | `stage9-scheduler-excerpts.txt` | read-only SSH source inspection (no `llama-cli` run) | ggml 0.9.0 split-scheduler excerpts with exact line numbers, op inventory and upstream `ggml-hexagon` code-volume measurement |
+| `stage10-service-smoke.txt` | `deploy_llama_cdsp.py`, `llama_cdsp_smoke.py`, HTTP requests | cDSP service on :8082 deployed; 55 `offloaded MUL_MAT` lines prove offload; CPU 3.57 vs cDSP 3.19 t/s (89.4%); PC-side WebUI/health 200 |
+
+## Stage 10 — cDSP HTTP service (application testing)
+
+Unlike Stages 6–9, this is a **long-running service**, not a one-shot CLI run.
+[`stage10-service-smoke.txt`](stage10-service-smoke.txt) records the deploy, the
+`--list-devices` probe, the temporary `GGML_CDSP_DEBUG=1` offload proof (and its
+removal), the A/B results and PC-side reachability. The unit/env templates,
+deploy script and usage notes are in
+[`docs/llama-cdsp-service.md`](../docs/llama-cdsp-service.md). The 89.4% ratio
+is an application-level demonstration, **not** a rigorous benchmark: both
+servers contend for the same 8 cores and Stage 7 showed a strong thermal
+ordering bias.
 
 ## Stage 9 — assessment only
 

@@ -401,6 +401,11 @@ benchmark (§5) is also **done**: SmolLM2-135M keeps all weights in the cache
 cache-residency hypothesis. **Stage 9** then assessed the last architectural
 lever without implementing it (source analysis only, no device changes):
 [`whole-layer-fusion-feasibility.md`](whole-layer-fusion-feasibility.md).
+**Stage 10** then packaged the backend as an independent HTTP service
+(`llama-cdsp.service`, port 8082) for application testing — see
+[`llama-cdsp-service.md`](llama-cdsp-service.md). It adds no new performance
+claim (89.4% of CPU in an A/B smoke test) and does not change any conclusion
+below.
 
 - **Remove split boundaries, not RPCs — CLOSED (assessed, not worth doing).**
   ~24 ms/token is spent in CPU↔ACCEL scheduler synchronization on the 135M

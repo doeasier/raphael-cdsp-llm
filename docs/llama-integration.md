@@ -11,6 +11,13 @@ Prerequisites: `scripts/device/deploy_cdsp_gemm.py` and
 install `libgemm_skel.so`, build `libggml-cdsp.so` and
 `libggml_cdsp_preload.so`, and run all correctness tests).
 
+> **Stage 10 addition.** Everything below still applies, but there is now a
+> turnkey alternative to hand-running `llama-cli`:
+> [`llama-cdsp.service`](llama-cdsp-service.md) serves the same backend over
+> HTTP/WebUI on port 8082 (stock CPU service stays on 8081). Start it with
+> `python3 scripts/device/deploy_llama_cdsp.py`, then run
+> `python3 scripts/device/llama_cdsp_smoke.py` for an A/B check.
+
 ---
 
 ## 1. Why an `LD_PRELOAD` shim is needed

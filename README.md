@@ -25,6 +25,7 @@ eXtensions).
 | 7 | Batched RPC: one FastRPC call per scheduler split | `BATCH_TEST PASS` (1056 elements); **−21.6% RPC latency**, 78–198 round-trips removed per run. End-to-end tokens/s unchanged — see §4.1 |
 | 8 | Small-model benchmark: does cache residency let cDSP beat CPU? | **No.** `SmolLM2-135M` weights fit entirely (42 MB, zero thrash) yet cDSP is only **29% of CPU**; quantified with `GGML_CDSP_PROFILE`, split stats and a zero-copy feasibility probe |
 | 9 | Whole-layer DSP fusion feasibility (assessment only, **no code/device changes**) | **Not worth it.** ggml 0.9.0 would merge the graph into one ACCEL split without a scheduler patch, but the ceiling is **~51.8 t/s = 64% of CPU** even with zero split overhead; V66 has no HMX/portable upstream skel. See [`docs/whole-layer-fusion-feasibility.md`](docs/whole-layer-fusion-feasibility.md) |
+| 10 | Package the backend as a real HTTP service for application testing | **`llama-cdsp.service` on port 8082** — same `llama-server` binary + `LD_PRELOAD` injection, stock CPU service (8081) untouched. Offload proven with 55 `[ggml-cdsp] offloaded MUL_MAT` lines; A/B 89.4% of CPU. See [`docs/llama-cdsp-service.md`](docs/llama-cdsp-service.md) |
 
 **Measured results (K20 Pro cDSP, HVX):**
 
@@ -142,6 +143,22 @@ are in [`docs/whole-layer-fusion-feasibility.md`](docs/whole-layer-fusion-feasib
 and [`evidence/stage9-scheduler-excerpts.txt`](evidence/stage9-scheduler-excerpts.txt).
 No `src/` file, skel, device state or service was changed.
 
+**Stage 10 — cDSP HTTP service for application testing (later the same day):**
+Stage 9 did not change the device, but applications still had no way to *use*
+the backend except a one-shot `llama-cli` run. A new **independent**
+`llama-cdsp.service` now serves the same `llama-server` binary on **port 8082**
+with the cDSP backend attached via `LD_PRELOAD`; the stock CPU service on 8081
+is untouched, so both can be exercised side by side. A temporary
+`GGML_CDSP_DEBUG=1` run proved real offload (**55 new `offloaded MUL_MAT`
+lines for a 4-token request**, `cache hits=66 misses=11`), and the DEBUG
+drop-in was removed afterwards. A/B: **CPU 3.57 t/s vs cDSP 3.19 t/s
+(89.4%)** — consistent with the Stage 6 negative result, not a new speedup.
+WebUI and API are reachable from the PC at `http://172.16.42.1:8082/`.
+See [`docs/llama-cdsp-service.md`](docs/llama-cdsp-service.md) and
+[`evidence/stage10-service-smoke.txt`](evidence/stage10-service-smoke.txt).
+No `llama-server`, `.so` or skel was rebuilt, no firmware/DTB/service was
+changed, and the device was not rebooted.
+
 ---
 
 ## Architecture
@@ -204,7 +221,8 @@ flowchart LR
     A5["Stage 5<br/>weight-cache RPC<br/>upload once, reuse handle<br/>CACHE_TEST PASS"] --> A6
     A6["Stage 6<br/>3-path HVX kernel +<br/>LD_PRELOAD shim +<br/>real llama.cpp inference<br/>32.2 GMAC/s, coherent output"] --> A7
     A7["Stage 7<br/>batched RPC per split<br/>BATCH_TEST PASS<br/>−21.6% RPC latency"] --> A8["Stage 8<br/>small-model benchmark<br/>42 MB cache, zero thrash<br/>still only 29% of CPU"] --> A9["Stage 9<br/>whole-layer fusion<br/>feasibility assessment only<br/>ceiling 64% of CPU"]
-    A9 --> DONE["Verdict: performance<br/>thread closed<br/>frozen negative result"]
+    A9 --> A10["Stage 10<br/>llama-cdsp.service :8082<br/>HTTP/WebUI for app testing<br/>offload proven, 89.4% of CPU"]
+    A10 --> DONE["Verdict: performance<br/>thread closed<br/>frozen negative result,<br/>service available for apps"]
 ```
 
 See [docs/reproduce.md](docs/reproduce.md) for the exact commands.
@@ -253,20 +271,26 @@ raphael-cdsp-llm/
 │   ├── k20_ssh.py            # USB-NCM SSH/SFTP helper (root@172.16.42.1)
 │   ├── deploy_cdsp_gemm.py   # Stage 1 + 5 + 6 bench + 7 batch + 8 regbuf
 │   ├── deploy_ggml_cdsp.py   # Stage 2/2.5/5/6 deploy + tests
-│   └── llama_diag.py         # llama-cli driver (modes, --model, --env, --seed, DSP precheck)
+│   ├── llama_diag.py         # llama-cli driver (modes, --model, --env, --seed, DSP precheck)
+│   ├── llama-cdsp.service    # Stage 10 systemd unit template (port 8082)
+│   ├── llama-cdsp.env        # Stage 10 EnvironmentFile template
+│   ├── deploy_llama_cdsp.py  # Stage 10 precheck + install + start + --status
+│   └── llama_cdsp_smoke.py   # Stage 10 HTTP A/B smoke test (8081 vs 8082)
 ├── evidence/
 │   ├── stage6-*.txt          # Stage 6 regression (9/9 + 5/5 PASS)
 │   ├── stage7-*.txt          # Stage 7 regression (10/10 + 5/5 PASS)
 │   ├── stage7-ab/            # deterministic A/B logs (thermal-bias analysis)
 │   ├── stage8-*-regression.txt# Stage 8 regression (21/21 + 5/5 PASS, REGBUF_TEST)
 │   ├── stage8/               # small-model CPU/cDSP correctness + timing logs
-│   └── stage9-scheduler-excerpts.txt  # ggml 0.9.0 split logic, exact line refs
+│   ├── stage9-scheduler-excerpts.txt  # ggml 0.9.0 split logic, exact line refs
+│   └── stage10-service-smoke.txt      # service deploy, offload proof, A/B, PC reachability
 └── docs/
     ├── architecture.md        # detailed architecture + HVX kernel notes
     ├── reproduce.md           # step-by-step reproduction
     ├── llama-integration.md   # llama-cli recipe, env vars, batch A/B, troubleshooting
     ├── next-steps.md          # Stage 5/6/7/8 results, roofline, remaining work
-    └── whole-layer-fusion-feasibility.md  # Stage 9 assessment + ranked alternatives
+    ├── whole-layer-fusion-feasibility.md  # Stage 9 assessment + ranked alternatives
+    └── llama-cdsp-service.md  # Stage 10 service usage, tuning, troubleshooting
 ```
 
 ---
@@ -346,6 +370,13 @@ python3 scripts/device/llama_diag.py normal --model smollm2-135m-q4_k_m.gguf \
     --env "GGML_CDSP_PROFILE=1 GGML_CDSP_SPLIT_STATS=1"
 #   -> CPU 81.2 t/s vs cDSP 23.8 t/s; [cdsp-prof] rpc=59.5%, 1.113 ms/op
 #   -> [cdsp-split] 2015 splits, 0 with >1 MUL_MAT (batching cannot help)
+
+# Stage 10 - install a cDSP-backed HTTP service on :8082 (CPU :8081 untouched)
+python3 scripts/device/deploy_llama_cdsp.py
+#   -> all prechecks OK, START_ISSUED, health READY
+python3 scripts/device/llama_cdsp_smoke.py --tokens 24
+#   -> CPU 3.57 t/s vs cDSP 3.19 t/s (89.4%), remoteproc stays 'running'
+# WebUI: http://172.16.42.1:8082/   (from the PC over USB-NCM)
 ```
 
 That is the whole proof. For the full walkthrough (env setup, expected log
