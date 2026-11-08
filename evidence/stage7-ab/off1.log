@@ -1,0 +1,47 @@
+RC=0
+load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b0-unknown
+model      : /root/models/Qwen3.5-4B-Q4_K_M.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> The capital of France is
+
+[Start thinking]
+
+Thinking Process:
+
+1.  **Analyze the Request:** The user is asking for the capital of France.
+
+2.  **Retrieve Knowledge:** Access general knowledge about geography and countries.
+    *   Country: France
+   
+
+[ Prompt: 5.6 t/s | Generation: 3.5 t/s ]
+
+
+Exiting...

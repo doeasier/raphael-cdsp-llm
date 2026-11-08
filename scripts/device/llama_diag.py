@@ -2,10 +2,16 @@
 """Run llama-cli on the K20 Pro with the cDSP ggml backend and collect a
 compact diagnostic result (generated text + offload/cache stats + timing).
 
-Used to attribute the "garbled generation" issue in Stage 6:
+Modes:
   normal   : cache + int8 + cDSP
   nocache  : no cache + int8 + cDSP   -> isolates STALE cache entries
   hostf32  : exact host F32 GEMM      -> isolates int8 / DSP / cache entirely
+  cpu      : no LD_PRELOAD            -> CPU baseline
+
+Stage 7 additions: `--env` injects arbitrary switches (e.g.
+GGML_CDSP_BATCH=1 GGML_CDSP_SPLIT_STATS=1), `--seed` / `--temp` make sampling
+deterministic for a fair A/B, and a pre-flight check refuses to benchmark a
+crashed cDSP remoteproc (which would otherwise report a misleading 0.0 t/s).
 """
 import argparse
 import os
@@ -38,13 +44,26 @@ def main():
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--no-debug", action="store_true",
                     help="omit GGML_CDSP_DEBUG for a fair timing measurement")
+    ap.add_argument("--env", default="",
+                    help="extra KEY=VAL pairs, e.g. 'GGML_CDSP_BATCH=1'")
+    ap.add_argument("--seed", type=int, default=-1,
+                    help="fixed RNG seed for deterministic A/B (-1 = random)")
+    ap.add_argument("--temp", default=None,
+                    help="sampling temperature, e.g. 0 for greedy decoding")
     a = ap.parse_args()
 
-    log = "/data/local/tmp/diag_%s.log" % a.mode
-    extra = MODES[a.mode]
+    sampling = ""
+    if a.seed >= 0:
+        sampling += " -s %d" % a.seed
+    if a.temp is not None:
+        sampling += " --temp %s" % a.temp
 
-    if extra == "__CPU__":
-        envs = ("LD_LIBRARY_PATH=%s:/usr/local/lib" % BIN)
+    log = "/data/local/tmp/diag_%s.log" % a.mode
+    extra = (MODES[a.mode] + " " + a.env).strip()
+
+    if MODES[a.mode] == "__CPU__":
+        envs = ("LD_LIBRARY_PATH=%s:/usr/local/lib %s"
+                % (BIN, a.env))
     else:
         envs = ("LD_LIBRARY_PATH=%s:/usr/local/lib "
                 "LD_PRELOAD=%s/libggml_cdsp_preload.so "
@@ -54,12 +73,23 @@ def main():
                    "" if a.no_debug else "GGML_CDSP_DEBUG=1", extra))
 
     cmd = ("cd %s && %s timeout %d ./llama-cli -m %s -p '%s' "
-           "-n %d -st -c 512 -t 4 --no-warmup > %s 2>&1; echo RC=$?; cat %s"
+           "-n %d -st -c 512 -t 4 --no-warmup%s > %s 2>&1; echo RC=$?; cat %s"
            % (BIN, envs, a.timeout - 30, MDL, a.prompt.replace("'", "'\\''"),
-              a.tokens, log, log))
+              a.tokens, sampling, log, log))
 
     c = k.connect()
     try:
+        # A crashed cDSP produces "Compute error" and 0.0 t/s, which is easy to
+        # mistake for a performance regression. Refuse to run in that state.
+        state_out, _, _ = k.run(
+            c, "cat /sys/class/remoteproc/remoteproc1/state 2>/dev/null",
+            timeout=20)
+        state = state_out.strip().splitlines()[-1] if state_out.strip() else "unknown"
+        if state != "running":
+            print("DSP_NOT_RUNNING: remoteproc1 state=%s" % state)
+            print("Recover with 'systemctl reboot' (NEVER kexec); sysfs "
+                  "stop/start does not clear a crashed PD.")
+            return 2
         out, err, st = k.run(c, cmd, timeout=a.timeout)
     finally:
         c.close()

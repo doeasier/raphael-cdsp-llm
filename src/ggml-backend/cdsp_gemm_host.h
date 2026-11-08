@@ -36,6 +36,17 @@ int cdsp_gemm_compute_cached(const int8_t * A, int M, int K, int N,
 // Release a previously uploaded weight handle, freeing its DSP memory.
 int cdsp_gemm_release(int32_t handle);
 
+// ---- BATCHED API (Stage 7) ------------------------------------------------
+// Ship several independent MUL_MATs in ONE FastRPC call. `dims` is
+//   { -count, M0,N0,K0,handle0, M1,N1,K1,handle1, ... }   (1 + 4*count int32)
+// `A` is concat(A_i) with sum(M_i*K_i) int8 bytes, `C` is concat(C_i) with
+// sum(M_i*N_i) int32 words. Returns 0 on success. This reuses the exact same
+// QAIC method as cdsp_gemm_compute_cached (only dimsLen/ALen/CLen differ),
+// so no stub/skel regeneration is needed.
+int cdsp_gemm_compute_multi(const int8_t * A, int ALen,
+                            const int32_t * dims, int dimsLen,
+                            int32_t * C, int CLen);
+
 #ifdef __cplusplus
 }
 #endif

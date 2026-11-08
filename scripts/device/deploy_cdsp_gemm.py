@@ -7,7 +7,9 @@ What it does:
   2. Compile host_test on the device (aarch64 gcc + libadsprpc).
   3. Install libgemm_skel.so into the cDSP search path (/usr/lib/rfsa/cdsp).
   4. Run host_test / host_test_cached at several sizes and report PASS/FAIL.
-  5. Run bench_cached (Stage 6 HVX microbenchmark): FastRPC ping, decode,
+  5. Run host_test_batch (Stage 7): verify the batched FastRPC encoding against
+     two scalar calls and measure the 2-RPC -> 1-RPC latency saving.
+  6. Run bench_cached (Stage 6 HVX microbenchmark): FastRPC ping, decode,
      square and prompt-batch shapes, with a DSP warm-up pass to avoid DVFS
      cold-clock numbers. Reports ms/call and effective GMAC/s.
 
@@ -37,6 +39,7 @@ CDSP_PATH  = "/usr/lib/rfsa/cdsp/libgemm_skel.so"
 LOCAL_FILES = [
     (os.path.join(SRC_HOST, "host_test.c"),        "host_test.c"),
     (os.path.join(SRC_HOST, "host_test_cached.c"), "host_test_cached.c"),
+    (os.path.join(SRC_HOST, "host_test_batch.c"),  "host_test_batch.c"),
     (os.path.join(SRC_HOST, "bench_cached.c"),     "bench_cached.c"),
     (os.path.join(GEN_DIR,  "gemm.h"),             "gen/gemm.h"),
     (os.path.join(GEN_DIR,  "cdsp_gemm_stub.c"),   "gen/cdsp_gemm_stub.c"),
@@ -92,6 +95,9 @@ def main():
         "host_test_cached.c gen/cdsp_gemm_stub.c -o host_test_cached "
         "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
         "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
+        "host_test_batch.c gen/cdsp_gemm_stub.c -o host_test_batch "
+        "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
+        "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
         "bench_cached.c gen/cdsp_gemm_stub.c -o bench_cached "
         "-L/usr/local/lib -ladsprpc -lpthread -ldl"
     )
@@ -133,6 +139,17 @@ def main():
         print(out)
         if err:
             print("STDERR:", err)
+
+    # Stage 7: batched FastRPC correctness + latency (two DIFFERENT weight
+    # shapes shipped in one call). Guards the concat offsets in the skel.
+    print("\n=== host_test_batch (Stage 7 batched RPC) ===")
+    out, err, st = run(c, f"cd {DEVICE_DIR} && ./host_test_batch 30", timeout=180)
+    print(out.strip())
+    if err:
+        print("STDERR:", err)
+    if "BATCH_TEST PASS" not in out or st != 0:
+        print("[!] BATCH_TEST FAILED (rc=%d)" % st)
+    print("BATCH_TEST PASS" if "BATCH_TEST PASS" in out else "BATCH_TEST FAIL")
 
     # Stage 6: HVX throughput. The cDSP ramps its clock under sustained load;
     # without this warm-up pass the first short shapes are 30-50% pessimistic.

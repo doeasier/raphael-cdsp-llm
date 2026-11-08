@@ -72,6 +72,26 @@ interface cdsp_gemm : remote_handle64 {
 > **QAIC quirk:** output scalars use `rout int32 handle` (the only accepted
 > output qualifier is `in` / `rout` / `inrout`; a bare `out` is rejected).
 
+### 2.1 Stage 7: batched encoding of `gemm_compute_cached`
+
+`dimsLen`, `ALen` and `CLen` are all variable, so the **same IDL method** also
+carries several independent GEMMs in one round-trip — no QAIC regeneration:
+
+```
+dims[0] < 0  ->  batched, count = -dims[0]
+dims = { -count, M0,N0,K0,h0, M1,N1,K1,h1, ... }   (1 + 4*count int32)
+A    = concat(A_i),  sum(M_i*K_i) int8
+C    = concat(C_i),  sum(M_i*N_i) int32
+handle argument is ignored; each group carries its own h
+```
+
+`dims[0] = M > 0` keeps the original single-op semantics. `gemm_dsp.c` walks
+the groups, validates each against its cached weight and calls the same
+`gemm_compute_with_bp()` kernel with the appropriate A/C offsets. Batch size is
+capped at 8. `src/host/host_test_batch.c` verifies the concat offsets with two
+different weight shapes and measures the 2-RPC → 1-RPC latency saving
+(2.505 → 1.962 ms, **−21.6%**).
+
 ## 3. The HVX int8 GEMM kernel (gemm_dsp.c)
 
 ### 3.1 Math
@@ -176,16 +196,30 @@ dataflow (TCM-resident tiles or batched RPC), not more unrolling.
 - Diagnostic switches: `GGML_CDSP_DEBUG`, `GGML_CDSP_TRACE`,
   `GGML_CDSP_NO_CACHE` (upload every time, to detect stale cache entries),
   `GGML_CDSP_HOST_F32` (exact host F32 GEMM using the same dequant helpers,
-  bypassing int8/DSP/cache — used to prove the layout path was clean).
+  bypassing int8/DSP/cache — used to prove the layout path was clean),
+  `GGML_CDSP_BATCH` (Stage 7: merge the split's independent MUL_MATs into one
+  RPC) and `GGML_CDSP_SPLIT_STATS` (dump a MUL_MAT-per-split histogram).
 - **llama.cpp 0.9.0 registration.** The device build has `GGML_BACKEND_DL=OFF`,
   so the CPU backend is statically registered and `llama_backend_init()` never
   calls `ggml_backend_load_all()`; `GGML_BACKEND_PATH` is therefore ignored.
   `cdsp_preload.c` is an `LD_PRELOAD` constructor that `dlopen`s `libggml.so`,
   resolves `ggml_backend_load` and registers the plugin directly. See
   [llama-integration.md](llama-integration.md).
-- `graph_compute()` walks the graph and calls `cdsp_mul_mat()` for each MUL_MAT
-  node. Tensors live in ordinary CPU host buffers (`ggml_backend_cpu_buffer_type`)
-  — FastRPC copies them to/from the DSP — so no custom buffer type is needed.
+- `graph_compute()` receives a whole **scheduler split**, not a single op. In
+  the default (scalar) path it walks the graph and calls `cdsp_mul_mat()` for
+  each MUL_MAT node. Tensors live in ordinary CPU host buffers
+  (`ggml_backend_cpu_buffer_type`) — FastRPC copies them to/from the DSP — so no
+  custom buffer type is needed.
+- **Split batching (Stage 7, `GGML_CDSP_BATCH=1`).** Measured on a 64-token
+  run: 528 splits / 726 MUL_MATs, **198 splits contain 2 independent matmuls**.
+  `cdsp_graph_compute()` collects these, verifies that no node consumes another
+  node's output (views resolved to their parent), prepares each op via
+  `cdsp_prepare_op()` (dequant, cache lookup, activation quantization), then
+  concatenates the A/C buffers and issues **one** `cdsp_gemm_compute_multi()`
+  call. `cdsp_finish_op()` applies the per-row/per-column scales afterwards.
+  Any non-batchable shape falls back to the scalar path. `GGML_CDSP_SPLIT_STATS=1`
+  reports the histogram and `rpcs_saved`. This removes 78–198 round-trips per
+  run but does **not** move tokens/s — see [llama-integration.md §4.1](llama-integration.md).
 - **Weight cache (Stage 5).** On the first MUL_MAT touching a given weight tensor,
   the plugin dequantizes the weight (if Q8_0) → float, quantizes its columns →
   int8 (per-column scale `sB`), transposes it to `(K×N)`, and calls
@@ -197,9 +231,10 @@ dataflow (TCM-resident tiles or batched RPC), not more unrolling.
   weight. On eviction (capacity exceeded) the handle is released on the DSP,
   freeing its prepacked buffer. `cdsp_backend_free()` releases all handles.
 - `cdsp_gemm_host.cpp` wraps the FastRPC session: `enable_unsigned_pd()`,
-  `cdsp_gemm_open(URI "&_dom=cdsp")`, and the four compute/upload/cached/release
-  calls. On non-Linux it stubs out so the plugin still compiles for API
-  validation.
+  `cdsp_gemm_open(URI "&_dom=cdsp")`, the compute/upload/cached/release calls,
+  plus `cdsp_gemm_compute_multi()` (Stage 7, a thin forwarder that reuses the
+  cached-compute QAIC method with a negative `dims[0]`). On non-Linux it stubs
+  out so the plugin still compiles for API validation.
 
 The whole plugin is pinned to the **ggml 0.9.0** ABI via a verbatim copy of
 `ggml-backend-impl.h` (byte-identical to the upstream source) and the committed

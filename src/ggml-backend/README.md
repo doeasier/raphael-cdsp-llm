@@ -1,11 +1,11 @@
-# src/ggml-backend — ggml cDSP backend plugin (Stage 2/2.5/5/6)
+# src/ggml-backend — ggml cDSP backend plugin (Stage 2/2.5/5/6/7)
 
 A `ggml` backend plugin that offloads `GGML_OP_MUL_MAT` to the cDSP.
 
 | File | Purpose |
 |---|---|
-| `ggml-cdsp.cpp` | Backend/device/reg registration + `cdsp_mul_mat` (dequant → quant → FastRPC → rescale) + **LRU weight cache** (Stage 5) + unified `cdsp_can_mul_mat()` predicate and diagnostic modes (Stage 6). |
-| `cdsp_gemm_host.{h,cpp}` | AP-side FastRPC session wrapper (`enable_unsigned_pd`, `cdsp_gemm_open`, `cdsp_gemm_compute`, `cdsp_gemm_upload`/`compute_cached`/`release`). |
+| `ggml-cdsp.cpp` | Backend/device/reg registration + `cdsp_mul_mat` (dequant → quant → FastRPC → rescale) + **LRU weight cache** (Stage 5) + unified `cdsp_can_mul_mat()` predicate and diagnostic modes (Stage 6) + **split batching** in `cdsp_graph_compute()` / `cdsp_prepare_op()` (Stage 7). |
+| `cdsp_gemm_host.{h,cpp}` | AP-side FastRPC session wrapper (`enable_unsigned_pd`, `cdsp_gemm_open`, `cdsp_gemm_compute`, `cdsp_gemm_upload`/`compute_cached`/`release`, `cdsp_gemm_compute_multi` for Stage 7). |
 | `ggml-backend-impl.h` | Verbatim copy of ggml 0.9.0 `ggml-backend-impl.h` (ABI pin). |
 | `cdsp_preload.c` | `LD_PRELOAD` shim registering the plugin into llama.cpp builds with `GGML_BACKEND_DL=OFF` (where `GGML_BACKEND_PATH` is never reached). |
 | `build_device.sh` | On-device build → `libggml-cdsp.so` (compiles the QAIC stub as C, links into the C++ lib). |
@@ -39,5 +39,12 @@ LD_LIBRARY_PATH=/path/to/libggml:/usr/local/lib ./test_cdsp
 
 Environment switches: `GGML_CDSP_CACHE_MB`, `GGML_CDSP_MAX_ELEMS`,
 `GGML_CDSP_MIN_ELEMS`, `GGML_CDSP_DEBUG`, `GGML_CDSP_TRACE`,
-`GGML_CDSP_NO_CACHE`, `GGML_CDSP_HOST_F32`, `GGML_CDSP_BACKEND_PATH`.
-See `docs/llama-integration.md` for the full table and the llama.cpp recipe.
+`GGML_CDSP_NO_CACHE`, `GGML_CDSP_HOST_F32`, `GGML_CDSP_BACKEND_PATH`,
+`GGML_CDSP_BATCH` (opt-in batched RPC), `GGML_CDSP_SPLIT_STATS` (split
+histogram).
+
+**Stage 7 note:** `GGML_CDSP_BATCH=1` merges the independent `MUL_MAT`s of one
+scheduler split into a single FastRPC call. It is off by default because the
+measured end-to-end tokens/s gain is nil (thermal noise dominates); see
+`docs/llama-integration.md` §4.1. The batched path reuses `cdsp_can_mul_mat()`
+and falls back to `cdsp_mul_mat()` for anything it cannot prepare.

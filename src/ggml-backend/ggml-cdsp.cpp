@@ -39,6 +39,7 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <climits>
 #include <vector>
 #include <unordered_map>
 
@@ -467,6 +468,178 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
 }
 
 // ---------------------------------------------------------------------------
+// Split statistics (Stage 7 feasibility probe for batched RPC)
+//
+// ggml_backend_sched hands the ACCEL backend a whole "split" through
+// graph_compute(). If a split contains several independent MUL_MAT nodes,
+// they can be shipped to the DSP in one FastRPC call. If every split has
+// exactly one node, batching at this level cannot help and the RPC cost must
+// instead be attacked by fusing host-side work.
+//
+// Enable with GGML_CDSP_SPLIT_STATS=1. The histogram is printed at .so unload
+// so the normal log stays clean.
+// ---------------------------------------------------------------------------
+static const bool g_split_stats_on = getenv("GGML_CDSP_SPLIT_STATS") != nullptr;
+static uint64_t g_split_calls = 0;
+// Stage 7 batch counters, dumped together with the split histogram below.
+static uint64_t g_batch_splits = 0;
+static uint64_t g_batch_ops    = 0;
+static uint64_t g_batch_saved  = 0;
+static uint64_t g_split_nodes = 0;
+static uint64_t g_split_mm    = 0;
+static uint64_t g_split_multi = 0;
+static uint64_t g_split_hist[9] = {};   // index 8 means "8 or more"
+
+__attribute__((destructor))
+static void cdsp_split_stats_dump(void) {
+    if (!g_split_stats_on && g_batch_ops == 0) return;
+    if (g_split_stats_on && g_split_calls > 0) {
+        fprintf(stderr,
+                "[cdsp-split] calls=%llu nodes=%llu mul_mat=%llu "
+                "splits_with_>1_mm=%llu\n",
+                (unsigned long long)g_split_calls,
+                (unsigned long long)g_split_nodes,
+                (unsigned long long)g_split_mm,
+                (unsigned long long)g_split_multi);
+        fprintf(stderr, "[cdsp-split] mm-per-split histogram:");
+        for (int i = 0; i < 9; i++)
+            fprintf(stderr, " %d%s=%llu", i, i == 8 ? "+" : "",
+                    (unsigned long long)g_split_hist[i]);
+        fprintf(stderr, "\n");
+    }
+    if (g_batch_ops > 0)
+        fprintf(stderr,
+                "[cdsp-batch] splits=%llu ops=%llu rpcs_saved=%llu\n",
+                (unsigned long long)g_batch_splits,
+                (unsigned long long)g_batch_ops,
+                (unsigned long long)g_batch_saved);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: batched RPC for the MUL_MAT nodes of ONE scheduler split
+//
+// ggml_backend_sched hands the ACCEL backend a whole "split" through
+// graph_compute(). Measured on Qwen3.5-4B (24 tokens): 208 splits, 286
+// MUL_MAT nodes, 78 splits contain 2 nodes. Those 78 round-trips can be
+// eliminated by shipping both ops in a single FastRPC call.
+//
+// Encoding (no IDL change!): cdsp_gemm_compute_cached with
+//   dims = { -count, M0,N0,K0,h0, M1,N1,K1,h1, ... }
+//   A    = concat(A_i), C = concat(C_i)
+// See src/dsp/gemm_dsp.c :: cdsp_gemm_gemm_compute_cached().
+//
+// Enable with GGML_CDSP_BATCH=1. When disabled (default) every op uses the
+// original scalar cdsp_mul_mat() path, so this is a clean A/B switch.
+// ---------------------------------------------------------------------------
+#define CDSP_BATCH_MAX 8
+
+static const bool g_batch_on = getenv("GGML_CDSP_BATCH") != nullptr;
+
+struct BatchOp {
+    int M = 0, N = 0, K = 0;
+    int32_t handle       = 0;
+    int32_t local_handle = 0;  // no-cache diagnostic: release after submit
+    std::vector<int8_t> Aq;
+    std::vector<float>  sA, sB;
+    float   * Cb  = nullptr;
+    int32_t * C32 = nullptr;   // view into the shared output buffer
+};
+
+// Prepare one MUL_MAT WITHOUT issuing its RPC. Returns false when the op is
+// not batchable; the caller then falls back to scalar cdsp_mul_mat().
+static bool cdsp_prepare_op(struct ggml_tensor * dst, BatchOp & op) {
+    if (!cdsp_can_mul_mat(dst)) return false;
+    struct ggml_tensor * w = dst->src[0];
+    struct ggml_tensor * a = dst->src[1];
+    const int64_t K = w->ne[0], N = w->ne[1], M = a->ne[1];
+    const int64_t B0 = a->ne[2] * a->ne[3];
+    const int64_t B1 = w->ne[2] * w->ne[3];
+    if (B0 != 1 || B1 > 1) return false;        // only single-batch shapes
+    if (M <= 0 || N <= 0 || K <= 0) return false;
+    if (M > INT_MAX || N > INT_MAX || K > INT_MAX) return false;
+    if (getenv("GGML_CDSP_HOST_F32")) return false;  // diagnostics: scalar path
+
+    if (getenv("GGML_CDSP_DEBUG"))
+        fprintf(stderr, "[ggml-cdsp] offloaded MUL_MAT M=%lld N=%lld K=%lld\n",
+                (long long)M, (long long)N, (long long)K);
+
+    const float   * A = (const float   *)a->data;
+    const uint8_t * W = (const uint8_t *)w->data;
+
+    wcache_init_cap();
+    const bool no_cache = getenv("GGML_CDSP_NO_CACHE") != nullptr;
+
+    WKey key{ (const void *)W, 0 };
+    auto it = no_cache ? g_wcache.end() : g_wcache.find(key);
+    CachedWeight local;
+    CachedWeight * pcw = nullptr;
+    if (it == g_wcache.end()) {
+        g_wcache_misses++;
+        std::vector<float> Bf((size_t)N * K);
+        if (w->type == GGML_TYPE_F32)
+            memcpy(Bf.data(), W, (size_t)N * K * sizeof(float));
+        else if (w->type == GGML_TYPE_Q8_0)
+            dequant_q8_0(W, (int)K, (int)N, Bf.data());
+        else
+            dequant_q4_k(W, (int)K, (int)N, Bf.data());
+        std::vector<int8_t> Bq((size_t)N * K);
+        std::vector<float>  sB((size_t)N);
+        for (int64_t n = 0; n < N; n++)
+            quant_vec(Bf.data() + n * K, (int)K, Bq.data() + n * K, &sB[n]);
+        std::vector<int8_t> Bt((size_t)K * N);
+        for (int64_t n = 0; n < N; n++)
+            for (int64_t k = 0; k < K; k++)
+                Bt[(size_t)k * N + n] = Bq[(size_t)n * K + k];
+        int32_t handle;
+        int rc = cdsp_gemm_upload(Bt.data(), (int)K, (int)N, &handle);
+        if (rc != 0) {
+            fprintf(stderr, "ggml-cdsp: DSP weight upload failed rc=%d\n", rc);
+            return false;
+        }
+        const int Kblk = (K + 3) / 4, nT = (N + 31) / 32;
+        const size_t packed = (size_t)nT * Kblk * 128;
+        local = CachedWeight{ handle, (int)N, (int)K, std::move(sB), packed,
+                              ++g_wcache_tick };
+        if (no_cache) {
+            pcw = &local;
+        } else {
+            wcache_evict_to_fit(packed);
+            g_wcache[key] = std::move(local);
+            g_wcache_bytes += packed;
+            it = g_wcache.find(key);
+            pcw = &it->second;
+        }
+    } else {
+        g_wcache_hits++;
+        pcw = &it->second;
+    }
+    pcw->last = ++g_wcache_tick;
+
+    op.M = (int)M; op.N = (int)N; op.K = (int)K;
+    op.handle = pcw->handle;
+    op.sB = pcw->sB;        // copy: g_wcache may rehash for the next op
+    op.Cb = (float *)dst->data;
+    if (no_cache && pcw == &local) op.local_handle = local.handle;
+
+    op.Aq.resize((size_t)M * K);
+    op.sA.resize((size_t)M);
+    for (int64_t m = 0; m < M; m++)
+        quant_vec(A + m * K, (int)K, op.Aq.data() + m * K, &op.sA[m]);
+    return true;
+}
+
+static void cdsp_finish_op(BatchOp & op) {
+    for (int m = 0; m < op.M; m++)
+        for (int n = 0; n < op.N; n++)
+            op.Cb[(size_t)m * op.N + n] =
+                op.sA[m] * op.sB[n] * (float)op.C32[(size_t)m * op.N + n];
+    if (op.local_handle) {
+        cdsp_gemm_release(op.local_handle);
+        op.local_handle = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // backend iface
 // ---------------------------------------------------------------------------
 static const char * cdsp_backend_get_name(ggml_backend_t) { return "cdsp"; }
@@ -483,6 +656,89 @@ static enum ggml_status cdsp_graph_compute(ggml_backend_t backend,
     (void)backend;
     // ggml_cgraph is opaque in the public headers, so use the graph accessor API
     const int n_nodes = ggml_graph_n_nodes(graph);
+    if (g_split_stats_on) {
+        int mm = 0;
+        for (int i = 0; i < n_nodes; i++)
+            if (ggml_graph_node(graph, i)->op == GGML_OP_MUL_MAT) mm++;
+        g_split_calls++;
+        g_split_nodes += (uint64_t)n_nodes;
+        g_split_mm    += (uint64_t)mm;
+        if (mm > 1) g_split_multi++;
+        g_split_hist[mm < 8 ? mm : 8]++;
+    }
+
+    // ---- Stage 7: try to ship all INDEPENDENT MUL_MATs of this split at once
+    if (g_batch_on && n_nodes >= 2) {
+        std::vector<ggml_tensor *> mm;
+        mm.reserve(n_nodes);
+        for (int i = 0; i < n_nodes; i++) {
+            struct ggml_tensor * t = ggml_graph_node(graph, i);
+            if (t->op == GGML_OP_MUL_MAT) mm.push_back(t);
+        }
+        // A node that consumes another MUL_MAT of this split cannot be merged
+        // (its activation would not exist yet). Views are resolved to their
+        // parent tensor before the check.
+        bool indep = mm.size() >= 2 && mm.size() <= CDSP_BATCH_MAX;
+        for (size_t i = 0; indep && i < mm.size(); i++) {
+            struct ggml_tensor * src[2] = { mm[i]->src[0], mm[i]->src[1] };
+            for (int k = 0; k < 2 && indep; k++) {
+                struct ggml_tensor * p = src[k];
+                if (!p) continue;
+                if (p->view_src) p = p->view_src;
+                for (size_t j = 0; j < mm.size(); j++)
+                    if (p == mm[j]) { indep = false; break; }
+            }
+        }
+
+        if (indep) {
+            std::vector<BatchOp> ops(mm.size());
+            bool ok = true;
+            for (size_t i = 0; i < mm.size(); i++)
+                if (!cdsp_prepare_op(mm[i], ops[i])) { ok = false; break; }
+            if (ok) {
+                size_t aLen = 0, cLen = 0;
+                for (const BatchOp & o : ops) {
+                    aLen += (size_t)o.M * o.K;
+                    cLen += (size_t)o.M * o.N;
+                }
+                std::vector<int8_t>  Abuf(aLen);
+                std::vector<int32_t> Cbuf(cLen, 0);
+                std::vector<int32_t> dims;
+                dims.reserve(1 + 4 * ops.size());
+                dims.push_back(-(int32_t)ops.size());
+                size_t ao = 0, co = 0;
+                for (BatchOp & o : ops) {
+                    memcpy(Abuf.data() + ao, o.Aq.data(), o.Aq.size());
+                    ao += o.Aq.size();
+                    dims.push_back(o.M); dims.push_back(o.N);
+                    dims.push_back(o.K); dims.push_back(o.handle);
+                    o.C32 = Cbuf.data() + co;
+                    co += (size_t)o.M * o.N;
+                }
+                int rc = cdsp_gemm_compute_multi(Abuf.data(), (int)ao,
+                                                 dims.data(), (int)dims.size(),
+                                                 Cbuf.data(), (int)co);
+                if (rc == 0) {
+                    for (BatchOp & o : ops) cdsp_finish_op(o);
+                    g_batch_splits++;
+                    g_batch_ops += ops.size();
+                    g_batch_saved += ops.size() - 1;
+                    return GGML_STATUS_SUCCESS;
+                }
+                // e.g. a cached handle was evicted between prepares. Re-run
+                // every node through the scalar path (which re-uploads).
+                fprintf(stderr,
+                        "[ggml-cdsp] batched RPC rc=%d, falling back to scalar\n",
+                        rc);
+            }
+            for (BatchOp & o : ops)
+                if (o.local_handle) {
+                    cdsp_gemm_release(o.local_handle);
+                    o.local_handle = 0;
+                }
+        }
+    }
+
     for (int i = 0; i < n_nodes; i++) {
         struct ggml_tensor * n = ggml_graph_node(graph, i);
         if (n->op == GGML_OP_MUL_MAT) {

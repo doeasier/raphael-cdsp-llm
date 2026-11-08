@@ -1,9 +1,9 @@
-# Integrating the cDSP backend with llama.cpp (Stage 6)
+# Integrating the cDSP backend with llama.cpp (Stage 6 + Stage 7)
 
 This document is the runnable recipe for loading `libggml-cdsp.so` into the
 device's **llama.cpp 0.9.0** build and offloading `GGML_OP_MUL_MAT` to the
 Redmi K20 Pro cDSP. It also records the measured end-to-end result on
-`Qwen3.5-4B-Q4_K_M.gguf`.
+`Qwen3.5-4B-Q4_K_M.gguf`, including the Stage 7 batched-RPC experiment.
 
 Prerequisites: `scripts/device/deploy_cdsp_gemm.py` and
 `scripts/device/deploy_ggml_cdsp.py` have both completed successfully (they
@@ -81,10 +81,22 @@ cache hits/misses and tokens/s), use the bundled driver:
 python3 scripts/device/llama_diag.py normal --tokens 64 --no-debug \
     --min-elems 100000 --max-elems 3000000
 python3 scripts/device/llama_diag.py cpu    --tokens 64 --no-debug   # baseline
+
+# Stage 7: batched RPC, with split statistics
+python3 scripts/device/llama_diag.py normal --tokens 64 --no-debug \
+    --min-elems 100000 --max-elems 3000000 \
+    --env "GGML_CDSP_BATCH=1 GGML_CDSP_SPLIT_STATS=1"
+
+# Deterministic A/B: fixed seed + greedy decoding removes sampling variance
+python3 scripts/device/llama_diag.py normal --tokens 48 --no-debug \
+    --seed 42 --temp 0 --min-elems 100000 --max-elems 3000000
 ```
 
 Modes: `normal` (cache + int8 + cDSP), `nocache` (bypass weight cache),
 `hostf32` (exact host F32 GEMM, no DSP/int8/cache), `cpu` (no preload).
+`--env` appends arbitrary `KEY=VAL` pairs; `--seed` / `--temp` make runs
+deterministic. The driver refuses to run when the cDSP remoteproc is not
+`running` (a crashed DSP yields a meaningless `0.0 t/s`).
 
 ---
 
@@ -100,6 +112,8 @@ Modes: `normal` (cache + int8 + cDSP), `nocache` (bypass weight cache),
 | `GGML_CDSP_TRACE` | unset | additionally dump `w`/`a`/`dst` type, `ne`, `nb`, contiguity, nbytes |
 | `GGML_CDSP_NO_CACHE` | unset | diagnostic: upload weights on every call (releases the handle after each), to detect stale cache entries |
 | `GGML_CDSP_HOST_F32` | unset | diagnostic: exact F32 GEMM on the AP using the same dequant helpers; bypasses int8, DSP and cache |
+| `GGML_CDSP_BATCH` | unset | **Stage 7**: merge all independent `MUL_MAT`s of one scheduler split into a single FastRPC call (see §4.1) |
+| `GGML_CDSP_SPLIT_STATS` | unset | print a histogram of `MUL_MAT`-per-split at `.so` unload, plus batched-RPC counts |
 
 `supports_op()` and `cdsp_mul_mat()` share **one** capability predicate
 (`cdsp_can_mul_mat()`), so `MIN_ELEMS` / `MAX_ELEMS` never cause the scheduler
@@ -139,6 +153,54 @@ but does **not** beat the CPU for this 4B model. Two structural reasons:
 use it for a 4B model. Small models whose int8 weights fit in the cache are
 the case where this backend should win.
 
+### 4.1 Stage 7: batched RPC — measured, but not an end-to-end win
+
+`ggml_backend_sched` hands the ACCEL backend a whole **split** through
+`graph_compute()`. With `GGML_CDSP_SPLIT_STATS=1` on a 64-token run we measured
+528 splits / 726 `MUL_MAT` nodes; **198 splits (37.5%) contain two independent
+`MUL_MAT`s** (Q/K/V-style projections sharing an activation). Those are
+mergeable. The backend now detects them, prepares each op (dequant, cache
+lookup, activation quantization), concatenates the A/C buffers and issues
+**one** FastRPC call:
+
+```
+dims = { -count, M0,N0,K0,h0, M1,N1,K1,h1, ... }
+A    = concat(A_i)      C = concat(C_i)
+```
+
+The negative `dims[0]` is the batch marker; it reuses the existing QAIC method
+(only `dimsLen`/`ALen`/`CLen` change), so **no IDL or stub/skel regeneration
+was needed**. Enable with `GGML_CDSP_BATCH=1`; when disabled the original
+scalar path runs unchanged. Correctness is guarded by
+`src/host/host_test_batch.c` (two *different* weight shapes, 1056 elements
+verified against scalar GEMM) and by greedy-decoding A/B, where batch-on and
+batch-off produce **byte-identical generated text**.
+
+| Measurement | Scalar (2 RPCs) | Batched (1 RPC) | Saving |
+|---|---|---|---|
+| `host_test_batch` latency per op-pair | 2.505 ms | 1.962 ms | **21.6%** |
+| earlier run, warmer DSP | 2.899 ms | 2.094 ms | 27.8% |
+| 64-token llama-cli, `MIN=100000` | 3.3–3.5 t/s | 3.2–3.4 t/s | **not measurable** |
+| 48-token, `MIN=0`, batch first | 2.9 t/s | 3.1 t/s | (order-biased, see below) |
+
+**Honest conclusion:** the batched encoding works and removes 78–198
+round-trips per run, but tokens/s does **not** improve in a way that survives
+controls. Deterministic A/B runs showed a strictly monotonic slowdown
+(3.5 → 3.4 → 3.3 → 3.2 t/s) regardless of mode — the uncooled phone throttles
+under consecutive runs, so whichever mode runs first wins by ~0.1–0.2 t/s.
+Reversing the order (ABBA: on 3.4, off 3.2) confirmed this is an ordering
+artefact, not a batching effect. The reason is arithmetic: ~0.8 ms saved per
+merged pair × ~3 pairs/token ≈ 2.4 ms against a ~280 ms/token budget (<1%),
+well inside the thermal noise. This matches the roofline finding in
+`docs/next-steps.md` §2.2 — the bottleneck is decode weight bandwidth and the
+CPU-side FFN matrices, not RPC count.
+
+`GGML_CDSP_BATCH=1` is therefore kept **opt-in**. The recommended config is
+unchanged: `MIN_ELEMS=100000 MAX_ELEMS=3000000`. Letting the tiny `1×32×2560`
+ops piggyback (`MIN=0` + batch) reached 3.1 t/s vs 2.9 t/s scalar, still below
+the 3.3 t/s of leaving them on the CPU — their DSP compute + quantization cost
+more than the RPC they save.
+
 ---
 
 ## 5. Troubleshooting
@@ -152,7 +214,8 @@ the case where this backend should win.
 | `RC=127` | environment assignments placed after `timeout` |
 | Very slow / hangs | cache thrash: lower `GGML_CDSP_MAX_ELEMS`, raise `GGML_CDSP_MIN_ELEMS`, or reduce `GGML_CDSP_CACHE_MB`. Check for a stray `llama-cli` with `pgrep -a llama-cli` |
 | `Compute error` from DSP | `systemctl restart cdsprpcd` and confirm `/usr/lib/rfsa/cdsp/libgemm_skel.so` is the current build |
-| `cdsp_gemm_open` returns `-1` / `0x8000041d` after a killed run | the cDSP subsystem has crashed. Check `cat /sys/class/remoteproc/remoteproc1/state` → `crashed` and `dmesg` for `qcom_q6v5_pas ... fatal error received`. Writing `stop`/`start` to that sysfs node does **not** recover it; use **`systemctl reboot`** (never `kexec`). Killing `llama-cli` with `kill -9` mid-FastRPC is the usual trigger — prefer the built-in `timeout` wrapper and let it exit cleanly |
+| `cdsp_gemm_open` returns `-1` / `0x8000041d` after a killed run | the cDSP subsystem has crashed. Check `cat /sys/class/remoteproc/remoteproc1/state` → `crashed` and `dmesg` for `qcom_q6v5_pas ... fatal error received`. Writing `stop`/`start` to that sysfs node does **not** recover it; use **`systemctl reboot`** (never `kexec`). Killing `llama-cli` with `kill -9` mid-FastRPC is one trigger — prefer the built-in `timeout` wrapper and let it exit cleanly |
+| `0.0 t/s` + `Error: Compute error` with no kill involved | **cDSP watchdog** after many consecutive long runs: `dmesg` shows `SFR Init: wdog or kernel error suspected` / `remoteproc1: crash detected in cdsp`. Seen after 8+ back-to-back 48-token runs. Same recovery (`systemctl reboot`, ~50 s over USB-NCM), then let the phone cool. `llama_diag.py` now checks `remoteproc1/state` before every run and refuses to report a meaningless benchmark when it is `crashed` |
 
 To attribute an accuracy regression, run the same prompt with
 `GGML_CDSP_HOST_F32=1` (exact host F32 GEMM). If that is coherent but the

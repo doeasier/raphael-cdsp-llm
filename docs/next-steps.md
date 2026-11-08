@@ -1,8 +1,9 @@
 # Next steps — making cDSP inference actually useful
 
-Stages 0–5 implemented and verified the transport path. **Stage 6 (this update)
-closed both open items**: §2 HVX peak tuning and §3 real llama.cpp inference.
-Everything below records the measured results and what remains.
+Stages 0–5 implemented and verified the transport path. **Stage 6** closed
+§2 HVX peak tuning and §3 real llama.cpp inference. **Stage 7** closed the
+former top priority, batched RPC (§4) — with a deliberately honest negative
+end-to-end result. Everything below records the measurements and what remains.
 
 ---
 
@@ -144,25 +145,68 @@ masking the Q8_0 fix.
 
 ---
 
-## 4. What remains (in priority order)
+## 4. Batched RPC — DONE (Stage 7), but not an end-to-end win
 
-1. **Batch RPC calls.** One FastRPC round-trip per `MUL_MAT` is now the dominant
-   cost (~50–60 calls/token). A batched `gemm_compute_multi` RPC (or a scheduler
-   hook that groups small MUL_MATs) is the highest-leverage next step.
-2. **Weight staging for large models** (§1.1): keep packed weights on the AP,
-   stream tiles to the DSP, amortize per-tile rather than per-layer. Needed
-   before FFN matrices can be offloaded for a 4B model.
-3. **Fuse the output rescale.** The host still multiplies each result by
-   `sA[m] * sB[n]`; doing this on the DSP with a fixed-point scale would remove
-   one host pass per op.
-4. **Better quantization** than symmetric per-vector int8 (per-block / per-K
-   group) to reduce the ~0.4–0.7% per-layer error.
-5. **Small-model benchmark.** A model whose int8 weights fit the cache is where
-   this backend should actually beat the CPU; that measurement is still open.
+`GGML_CDSP_SPLIT_STATS=1` showed why batching looked promising: on a 64-token
+run, 528 scheduler splits contained 726 `MUL_MAT` nodes and **198 splits
+(37.5%) held two independent matmuls**. Implementation (`GGML_CDSP_BATCH=1`):
+
+- `cdsp_graph_compute()` collects the split's `MUL_MAT`s, checks that none
+  consumes another's output (views resolved to their parent), and prepares all
+  of them — dequant, weight-cache lookup, activation quantization — before
+  issuing a single FastRPC call.
+- `dims = { -count, M0,N0,K0,h0, ... }` with `A = concat(A_i)` and
+  `C = concat(C_i)`. The negative marker reuses the existing QAIC method, so
+  **no IDL / stub regeneration** was required; only `gemm_dsp.c`, the host
+  wrapper and the backend changed.
+- `src/host/host_test_batch.c` guards correctness with two *different* weight
+  shapes (1056 elements, `BATCH_TEST PASS`). With `--seed 42 --temp 0`,
+  batch-on and batch-off generate **identical text**.
+
+| Level | Scalar | Batched | Delta |
+|---|---|---|---|
+| RPC pair latency (`host_test_batch 30`) | 2.505 ms | **1.962 ms** | **−21.6%** |
+| 64-token llama-cli (`MIN=100000`) | 3.3–3.5 t/s | 3.2–3.4 t/s | none measurable |
+
+The honest result: **saving 78–198 round-trips does not move tokens/s.**
+Consecutive deterministic A/B runs slow monotonically (3.5 → 3.4 → 3.3 →
+3.2 t/s) under thermal throttling; reversing the order (ABBA: on 3.4, off 3.2)
+shows whichever mode runs first wins ~0.1–0.2 t/s. The theoretical ceiling is
+~0.8 ms/pair × ~3 pairs/token ≈ 2.4 ms against ~280 ms/token (<1%), far inside
+that noise. This is consistent with §2.2: decode is **weight-bandwidth bound**
+and the CPU still computes the large FFN matrices. Batch mode is therefore
+kept **opt-in** and the recommended config is unchanged.
+
+A useful corollary: letting tiny `1×32×2560` ops piggyback (`MIN=0` + batch)
+gives 3.1 t/s vs 2.9 t/s scalar, still below the 3.3 t/s of leaving them on
+the CPU — their DSP compute + quantization cost more than the RPC saved.
+
+Full measurements and the ordering-bias analysis: `docs/llama-integration.md`
+§4.1, `evidence/stage7-*.txt`, `evidence/stage7-ab/`.
 
 ---
 
-## 5. Known limitations
+## 5. What remains (in priority order)
+
+1. **Small-model benchmark.** A model whose int8 weights fit the 256 MB cache
+   is where this backend should actually beat the CPU; that measurement is
+   still open and is now the highest-value experiment. The device currently
+   only has `Qwen3.5-4B-Q4_K_M.gguf` (2.74 GB).
+2. **Weight staging for large models** (§1.1): keep packed weights on the AP,
+   stream tiles to the DSP, amortize per-tile rather than per-layer. Needed
+   before FFN matrices can be offloaded for a 4B model.
+3. **Change the decode dataflow.** More HVX unrolling cannot help: M=1 decode
+   is 1 byte/MAC memory-bound. Keeping packed weights in TCM or batching
+   *across tokens* are the remaining structural options.
+4. **Fuse the output rescale.** The host still multiplies each result by
+   `sA[m] * sB[n]`; doing this on the DSP with a fixed-point scale would remove
+   one host pass per op.
+5. **Better quantization** than symmetric per-vector int8 (per-block / per-K
+   group) to reduce the ~0.4–0.7% per-layer error.
+
+---
+
+## 6. Known limitations
 
 - Only `GGML_OP_MUL_MAT` is offloaded; RoPE, RMSNorm, softmax and sampling stay
   on the CPU. By design for this PoC.
@@ -180,3 +224,9 @@ masking the Q8_0 fix.
 - `ggml_backend_load_all()` is bypassed via `LD_PRELOAD` because this device's
   llama.cpp has `GGML_BACKEND_DL=OFF`; a build with `GGML_BACKEND_DL=ON` can
   use `GGML_BACKEND_PATH` directly.
+- Batched RPC only merges splits whose `MUL_MAT`s are mutually independent and
+  single-batch (`B0 == 1`, `B1 <= 1`), at most 8 ops; everything else falls
+  back to the scalar path. It is opt-in because it does not improve tokens/s.
+- Sustained back-to-back llama-cli runs can trip the cDSP watchdog even with
+  clean shutdowns (`SFR Init: wdog or kernel error suspected`). Only
+  `systemctl reboot` clears a `crashed` remoteproc; sysfs stop/start does not.

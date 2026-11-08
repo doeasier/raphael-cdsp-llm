@@ -1,0 +1,14 @@
+MODE       : normal
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 5.6 t/s | Generation: 3.5 t/s 
+--- OUTPUT ---
+> The capital of France is
+[Start thinking]
+Thinking Process:
+1.  **Analyze the Request:** The user is asking for the capital of France.
+2.  **Retrieve Knowledge:** Access general knowledge about geography and countries.
+    *   Country: France
+[ Prompt: 5.6 t/s | Generation: 3.5 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_normal.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_normal.host.log

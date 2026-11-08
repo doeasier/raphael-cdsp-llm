@@ -105,6 +105,17 @@ int cdsp_gemm_compute_cached(const int8_t * A, int M, int K, int N,
         C, (int)((size_t)M * N));
 }
 
+int cdsp_gemm_compute_multi(const int8_t * A, int ALen,
+                            const int32_t * dims, int dimsLen,
+                            int32_t * C, int CLen) {
+    int rc = ensure_session();
+    if (rc != 0) return rc;
+    // handle argument is ignored by the skel in batched mode (dims[0] < 0);
+    // every group carries its own handle in dims.
+    return cdsp_gemm_gemm_compute_cached(
+        g_h, A, ALen, dims, dimsLen, 0, C, CLen);
+}
+
 int cdsp_gemm_release(int32_t handle) {
     if (!g_open) return 0;
     return cdsp_gemm_gemm_release(g_h, handle);

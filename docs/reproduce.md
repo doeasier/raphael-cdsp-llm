@@ -285,6 +285,31 @@ thermals — always compare the two configurations in the same time window.
 > sysfs `stop`/`start` does not recover it, only `systemctl reboot` (never
 > `kexec`) does. All subsequent `cdsp_gemm_open` calls then fail with `rc=-1`.
 
+### 5.4 Stage 7 — batched RPC (opt-in)
+
+Rebuild both sides (`build_win.sh` for the skel, `deploy_cdsp_gemm.py` +
+`deploy_ggml_cdsp.py` to install and verify). The deploy script now also builds
+and runs `host_test_batch.c`:
+
+```bash
+python3 scripts/device/deploy_cdsp_gemm.py | tee evidence/stage7-dsp-regression.txt
+#   -> host: BATCH_TEST PASS - 1056 elements verified correct.
+#   -> host: scalar 2 RPCs = 2.505 ms/pair; batched 1 RPC = 1.962 ms/pair
+
+python3 scripts/device/llama_diag.py normal --tokens 48 --no-debug \
+    --seed 42 --temp 0 --min-elems 100000 --max-elems 3000000 \
+    --env "GGML_CDSP_BATCH=1 GGML_CDSP_SPLIT_STATS=1"
+#   -> [cdsp-split] calls=208 nodes=572 mul_mat=286 splits_with_>1_mm=78
+#   -> [cdsp-batch] splits=78 ops=156 rpcs_saved=78
+```
+
+`--seed` + `--temp 0` make the run deterministic, so batch-on and batch-off
+generated text can be compared byte-for-byte (they are identical). Do **not**
+chain more than a handful of long runs back-to-back: the cDSP watchdog can fire
+even with clean exits (`SFR Init: wdog or kernel error suspected`), producing
+`0.0 t/s`. `llama_diag.py` checks `remoteproc1/state` before each run; recover
+with `systemctl reboot` and let the phone cool.
+
 ---
 
 ## 6. Troubleshooting
@@ -302,21 +327,26 @@ thermals — always compare the two configurations in the same time window.
 | `RC=127` | env assignments placed after `timeout` | put `LD_LIBRARY_PATH=... LD_PRELOAD=...` **before** `timeout` |
 | No `loaded cdsp backend` line | `GGML_BACKEND_PATH` alone does nothing with `GGML_BACKEND_DL=OFF` | use `LD_PRELOAD=.../libggml_cdsp_preload.so` (§5.3 / llama-integration.md) |
 | Benchmark numbers 30–50% low | cDSP DVFS cold clock | run a 200-iteration warm-up shape first (`deploy_cdsp_gemm.py` does this) |
+| `0.0 t/s` + `Error: Compute error`, no `kill -9` involved | cDSP **watchdog** after 8+ consecutive long runs (`SFR Init: wdog or kernel error suspected`; `remoteproc1=crashed`) | `systemctl reboot` (never `kexec`), then let the device cool. `llama_diag.py` pre-checks the remoteproc state and refuses to benchmark a crashed DSP |
+| A/B results where "whichever ran first" is faster | thermal throttling, not a real speedup | use `--seed 42 --temp 0` and an ABBA run order (on/off/off/on) to cancel the linear trend |
 
 ---
 
 ## 7. What is NOT done yet
 
-Stages 0–6 are implemented and verified. Remaining work, in priority order
-(full rationale in [next-steps.md](next-steps.md) §4):
+Stages 0–7 are implemented and verified. Batched RPC (the former top priority)
+is **done** — it removes 78–198 FastRPC round-trips per run and cuts RPC-pair
+latency by 21.6%, but does **not** improve end-to-end tokens/s
+([next-steps.md](next-steps.md) §4). Remaining work, in priority order:
 
-- **Batch RPC calls.** One FastRPC round-trip per `MUL_MAT` (~50–60/token,
-  ~0.25 ms each measured for a 128-MAC ping) is now the dominant cost.
+- **Small-model benchmark.** A model whose int8 weights fit the 256 MB cache is
+  where the backend should actually beat the CPU; not yet measured. The phone
+  currently only has the 2.74 GB `Qwen3.5-4B-Q4_K_M.gguf`.
 - **Weight staging for large models.** The 256 MB cache cannot hold a 4B model
   as int8, so only small/medium matrices are offloaded; the large FFN GEMMs
   stay on the CPU. Streaming tiles from AP memory is the next structural step.
-- **Small-model benchmark.** A model whose int8 weights fit the cache is where
-  the backend should actually beat the CPU; not yet measured.
+- **Change the decode dataflow.** M=1 decode is 1 byte/MAC memory-bound; TCM
+  residency or cross-token batching, not more HVX unrolling.
 - **Fuse the output rescale** on the DSP, and use better-than-per-vector int8
   quantization (currently ~0.4–0.7% relative error per layer).
 - Only `GGML_OP_MUL_MAT` is offloaded; all other ops run on the CPU. By design

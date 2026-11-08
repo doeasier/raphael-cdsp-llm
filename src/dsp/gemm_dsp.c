@@ -425,32 +425,78 @@ int __QAIC_HEADER(cdsp_gemm_gemm_upload)(remote_handle64 _h,
 }
 
 /* ---- weight cache: compute using cached B ------------------------------ */
+/* Two encodings, selected by the sign of dims[0]:
+ *
+ *  SINGLE  (dims[0] = M > 0):
+ *      dims   = { M, N, K }, `handle` selects the cached weight,
+ *      A      = M*K int8,  C = M*N int32.
+ *
+ *  BATCHED (dims[0] = -count < 0, Stage 7):
+ *      dims   = { -count, M0,N0,K0,h0, M1,N1,K1,h1, ... }
+ *      A      = concat(A0, A1, ...), each Mi*Ki int8,
+ *      C      = concat(C0, C1, ...), each Mi*Ni int32,
+ *      handle = ignored (each group carries its own h).
+ *
+ * The batched encoding lets the ggml backend ship every independent MUL_MAT
+ * of one scheduler split through a SINGLE FastRPC round-trip, without changing
+ * the QAIC-generated stub/skel signatures (dimsLen/ALen/CLen are variable).
+ */
+#define CDSP_MAX_BATCH 8
+
 int __QAIC_HEADER(cdsp_gemm_gemm_compute_cached)(remote_handle64 _h,
                                                   const int8* A, int ALen,
                                                   const int32* dims, int dimsLen,
                                                   int32_t handle,
                                                   int32* C, int CLen) {
     if (dims == NULL || dimsLen < 3) return -1;
-    int M = dims[0], N = dims[1], K = dims[2];
     if (A == NULL || C == NULL) return -2;
-    if (M <= 0 || N <= 0 || K <= 0) return -3;
-    if (ALen < M * K) return -4;
-    if (CLen < M * N) return -5;
 
-    wcache_t *e = NULL;
-    for (int i = 0; i < WCACHE_MAX; i++) {
-        if (g_wcache[i].handle == handle) { e = &g_wcache[i]; break; }
-    }
-    if (e == NULL || e->bp == NULL) return -6;     /* unknown handle */
-    if (e->N != N || e->K != K)    return -7;      /* dims mismatch */
+    if (dims[0] >= 0) {
+        int M = dims[0], N = dims[1], K = dims[2];
+        if (M <= 0 || N <= 0 || K <= 0) return -3;
+        if (ALen < M * K) return -4;
+        if (CLen < M * N) return -5;
 
-    int rc = gemm_compute_with_bp(_h, A, M, N, K, e->bp, C);
-    /* gemm_compute_with_bp only fails on HVX lock failure. The same session
-     * that successfully uploaded the weight must have HVX, so this path is
-     * effectively unreachable; zero C defensively rather than faulting. */
-    if (rc != 0) {
-        memset(C, 0, (size_t)M * N * sizeof(int32_t));
+        wcache_t *e = NULL;
+        for (int i = 0; i < WCACHE_MAX; i++) {
+            if (g_wcache[i].handle == handle) { e = &g_wcache[i]; break; }
+        }
+        if (e == NULL || e->bp == NULL) return -6;     /* unknown handle */
+        if (e->N != N || e->K != K)    return -7;      /* dims mismatch */
+
+        int rc = gemm_compute_with_bp(_h, A, M, N, K, e->bp, C);
+        /* gemm_compute_with_bp only fails on HVX lock failure. The same session
+         * that successfully uploaded the weight must have HVX, so this path is
+         * effectively unreachable; zero C defensively rather than faulting. */
+        if (rc != 0) memset(C, 0, (size_t)M * N * sizeof(int32_t));
         return 0;
+    }
+
+    /* ---- BATCHED ---- */
+    const int count = -dims[0];
+    if (count <= 0 || count > CDSP_MAX_BATCH) return -8;
+    if (dimsLen < 1 + 4 * count) return -9;
+
+    size_t aoff = 0, coff = 0;
+    for (int j = 0; j < count; j++) {
+        const int32_t *d = dims + 1 + 4 * j;
+        const int M = d[0], N = d[1], K = d[2], h = d[3];
+        if (M <= 0 || N <= 0 || K <= 0) return -3;
+        if ((size_t)ALen < aoff + (size_t)M * K) return -4;
+        if ((size_t)CLen < coff + (size_t)M * N) return -5;
+
+        wcache_t *e = NULL;
+        for (int i = 0; i < WCACHE_MAX; i++) {
+            if (g_wcache[i].handle == h) { e = &g_wcache[i]; break; }
+        }
+        if (e == NULL || e->bp == NULL) return -6;
+        if (e->N != N || e->K != K)    return -7;
+
+        int rc = gemm_compute_with_bp(_h, A + aoff, M, N, K,
+                                      e->bp, C + coff);
+        if (rc != 0) memset(C + coff, 0, (size_t)M * N * sizeof(int32_t));
+        aoff += (size_t)M * K;
+        coff += (size_t)M * N;
     }
     return 0;
 }
