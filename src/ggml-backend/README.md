@@ -1,10 +1,10 @@
-# src/ggml-backend — ggml cDSP backend plugin (Stage 2/2.5/5/6/7)
+# src/ggml-backend — ggml cDSP backend plugin (Stage 2/2.5/5/6/7/8)
 
 A `ggml` backend plugin that offloads `GGML_OP_MUL_MAT` to the cDSP.
 
 | File | Purpose |
 |---|---|
-| `ggml-cdsp.cpp` | Backend/device/reg registration + `cdsp_mul_mat` (dequant → quant → FastRPC → rescale) + **LRU weight cache** (Stage 5) + unified `cdsp_can_mul_mat()` predicate and diagnostic modes (Stage 6) + **split batching** in `cdsp_graph_compute()` / `cdsp_prepare_op()` (Stage 7). |
+| `ggml-cdsp.cpp` | Backend/device/reg registration + `cdsp_mul_mat` (dequant → quant → FastRPC → rescale) + **LRU weight cache** (Stage 5) + unified `cdsp_can_mul_mat()` predicate and diagnostic modes (Stage 6) + **split batching** in `cdsp_graph_compute()` / `cdsp_prepare_op()` (Stage 7) + `GGML_CDSP_PROFILE` four-stage timers (Stage 8). |
 | `cdsp_gemm_host.{h,cpp}` | AP-side FastRPC session wrapper (`enable_unsigned_pd`, `cdsp_gemm_open`, `cdsp_gemm_compute`, `cdsp_gemm_upload`/`compute_cached`/`release`, `cdsp_gemm_compute_multi` for Stage 7). |
 | `ggml-backend-impl.h` | Verbatim copy of ggml 0.9.0 `ggml-backend-impl.h` (ABI pin). |
 | `cdsp_preload.c` | `LD_PRELOAD` shim registering the plugin into llama.cpp builds with `GGML_BACKEND_DL=OFF` (where `GGML_BACKEND_PATH` is never reached). |
@@ -41,10 +41,18 @@ Environment switches: `GGML_CDSP_CACHE_MB`, `GGML_CDSP_MAX_ELEMS`,
 `GGML_CDSP_MIN_ELEMS`, `GGML_CDSP_DEBUG`, `GGML_CDSP_TRACE`,
 `GGML_CDSP_NO_CACHE`, `GGML_CDSP_HOST_F32`, `GGML_CDSP_BACKEND_PATH`,
 `GGML_CDSP_BATCH` (opt-in batched RPC), `GGML_CDSP_SPLIT_STATS` (split
-histogram).
+histogram), `GGML_CDSP_PROFILE` (Stage 8 stage timers).
 
 **Stage 7 note:** `GGML_CDSP_BATCH=1` merges the independent `MUL_MAT`s of one
 scheduler split into a single FastRPC call. It is off by default because the
 measured end-to-end tokens/s gain is nil (thermal noise dominates); see
 `docs/llama-integration.md` §4.1. The batched path reuses `cdsp_can_mul_mat()`
 and falls back to `cdsp_mul_mat()` for anything it cannot prepare.
+
+**Stage 8 note:** `GGML_CDSP_PROFILE=1` accumulates four timers per scalar
+`cdsp_mul_mat()` (weight/cache, activation quantization, FastRPC, output
+rescale) and prints them at `.so` unload. On SmolLM2-135M it showed FastRPC at
+1.113 ms/op (59.5%) and output rescale at just 0.8% — evidence that further
+host-side micro-optimization cannot close the 3.4× gap to CPU. The batched
+path (`cdsp_prepare_op`) does not feed these timers; use the scalar path for
+profiling. See `docs/next-steps.md` §5.2.

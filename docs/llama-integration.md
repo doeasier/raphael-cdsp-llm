@@ -1,9 +1,10 @@
-# Integrating the cDSP backend with llama.cpp (Stage 6 + Stage 7)
+# Integrating the cDSP backend with llama.cpp (Stage 6 / 7 / 8)
 
 This document is the runnable recipe for loading `libggml-cdsp.so` into the
 device's **llama.cpp 0.9.0** build and offloading `GGML_OP_MUL_MAT` to the
-Redmi K20 Pro cDSP. It also records the measured end-to-end result on
-`Qwen3.5-4B-Q4_K_M.gguf`, including the Stage 7 batched-RPC experiment.
+Redmi K20 Pro cDSP. It records the measured end-to-end results on
+`Qwen3.5-4B-Q4_K_M.gguf` (Stage 6/7) and on `smollm2-135m-q4_k_m.gguf`
+(Stage 8, §4.2).
 
 Prerequisites: `scripts/device/deploy_cdsp_gemm.py` and
 `scripts/device/deploy_ggml_cdsp.py` have both completed successfully (they
@@ -90,13 +91,33 @@ python3 scripts/device/llama_diag.py normal --tokens 64 --no-debug \
 # Deterministic A/B: fixed seed + greedy decoding removes sampling variance
 python3 scripts/device/llama_diag.py normal --tokens 48 --no-debug \
     --seed 42 --temp 0 --min-elems 100000 --max-elems 3000000
+
+# Stage 8: a second, small model (filename is resolved under /root/models)
+python3 scripts/device/llama_diag.py cpu --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0
+python3 scripts/device/llama_diag.py normal --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0 \
+    --min-elems 500000 --max-elems 2000000
+
+# Stage 8: attribute where backend time goes
+python3 scripts/device/llama_diag.py normal --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0 \
+    --min-elems 500000 --max-elems 2000000 \
+    --env "GGML_CDSP_PROFILE=1"
 ```
 
 Modes: `normal` (cache + int8 + cDSP), `nocache` (bypass weight cache),
 `hostf32` (exact host F32 GEMM, no DSP/int8/cache), `cpu` (no preload).
 `--env` appends arbitrary `KEY=VAL` pairs; `--seed` / `--temp` make runs
-deterministic. The driver refuses to run when the cDSP remoteproc is not
-`running` (a crashed DSP yields a meaningless `0.0 t/s`).
+deterministic; `--model` takes a **bare GGUF filename** (or a device-absolute
+path), `--cache-mb` overrides `GGML_CDSP_CACHE_MB`, `--threads` sets `-t`.
+The driver refuses to run when the cDSP remoteproc is not `running` (a crashed
+DSP yields a meaningless `0.0 t/s`).
+
+> **Windows/Git Bash:** passing `--model /root/models/x.gguf` gets rewritten by
+> MSYS into `C:/Program Files/.../root/models/x.gguf`. Always pass the bare
+> filename; `llama_diag.py` resolves it under `/root/models` and rejects a
+> rewritten path with a clear error.
 
 ---
 
@@ -114,6 +135,7 @@ deterministic. The driver refuses to run when the cDSP remoteproc is not
 | `GGML_CDSP_HOST_F32` | unset | diagnostic: exact F32 GEMM on the AP using the same dequant helpers; bypasses int8, DSP and cache |
 | `GGML_CDSP_BATCH` | unset | **Stage 7**: merge all independent `MUL_MAT`s of one scheduler split into a single FastRPC call (see §4.1) |
 | `GGML_CDSP_SPLIT_STATS` | unset | print a histogram of `MUL_MAT`-per-split at `.so` unload, plus batched-RPC counts |
+| `GGML_CDSP_PROFILE` | unset | **Stage 8**: print a four-stage timing breakdown (weight/cache, activation quant, FastRPC, output rescale) at `.so` unload |
 
 `supports_op()` and `cdsp_mul_mat()` share **one** capability predicate
 (`cdsp_can_mul_mat()`), so `MIN_ELEMS` / `MAX_ELEMS` never cause the scheduler
@@ -150,8 +172,9 @@ but does **not** beat the CPU for this 4B model. Two structural reasons:
   those and is the main reason for the 73% → 94% improvement.
 
 `MAX_ELEMS=0` (full offload) was tried and **hangs** on cache thrash; do not
-use it for a 4B model. Small models whose int8 weights fit in the cache are
-the case where this backend should win.
+use it for a 4B model. The natural follow-up hypothesis was that a small model,
+whose int8 weights fit entirely in the cache, is where this backend should win.
+**Stage 8 tested exactly that and falsified it — see §4.2.**
 
 ### 4.1 Stage 7: batched RPC — measured, but not an end-to-end win
 
@@ -201,6 +224,54 @@ ops piggyback (`MIN=0` + batch) reached 3.1 t/s vs 2.9 t/s scalar, still below
 the 3.3 t/s of leaving them on the CPU — their DSP compute + quantization cost
 more than the RPC they save.
 
+### 4.2 Stage 8: small model (SmolLM2-135M-Q4_K_M) — weights fit, still slower
+
+Model: `smollm2-135m-q4_k_m.gguf` (101 MB, 30 layers, emb 576, FFN 1536,
+vocab 49152). Transfer it to `/root/models/` first (see `docs/reproduce.md`
+§4). Clean-state runs, 64 tokens, `--seed 42 --temp 0 --no-debug`:
+
+| Configuration | Prompt | Generation | vs CPU |
+|---|---|---|---|
+| CPU only | 123.2 t/s | **81.2 t/s** | 100% |
+| cDSP, best (`MIN=500000 MAX=2000000`, FFN only) | 47.1 t/s | **23.8 t/s** | 29% |
+| cDSP, full offload (`MIN=0 MAX=0`) | 44.3 t/s | 13.4 t/s | 17% |
+| cDSP, `GGML_CDSP_BATCH=1` | 48.7 t/s | 19.0 t/s | no gain |
+| cDSP, `GGML_CDSP_NO_CACHE=1` | 17.4 t/s | 1.4 t/s | cache is worth 17.6× |
+
+**Cache residency was confirmed, then falsified as the explanation**: full
+offload reports `cache hits=1984 misses=31 bytes=44015616` — 42 MB, zero
+thrash — exactly the scenario Stage 6 predicted would win. It is still 3.4×
+slower than four CPU threads.
+
+Where the time goes (full analysis in `docs/next-steps.md` §5.2):
+
+- `GGML_CDSP_SPLIT_STATS=1`: 2015 splits / 2015 `MUL_MAT` nodes /
+  **0 splits with >1 matmul**. The 135M graph alternates CPU-only ops and
+  matmuls, so Stage 7 batching has nothing to merge (`BATCH=1`: 19.0 vs
+  19.4 t/s).
+- `GGML_CDSP_PROFILE=1`: FastRPC + DSP GEMM takes 1157.1 ms over 1040 ops
+  (**1.113 ms/op, 59.5%** of backend time); activation quant 3.2%, output
+  rescale 0.8%, cold weight uploads 36.5%.
+- ~24 ms/token sits **outside** the backend in CPU↔ACCEL split
+  synchronization. Loading the backend with zero offloads
+  (`MIN_ELEMS=100000000`) still gives 71.0 t/s vs CPU 80.6 t/s, so this is not
+  registration overhead.
+- Persistent zero-copy is ruled out on this kernel: `fastrpc_mmap()` returns
+  `AEE_EUNSUPPORTED (0x14)` with dmesg `mem mmap error`, and
+  `rpcmem_alloc_def` buffers are 1.6–36.6% **slower** than plain `malloc`
+  (`src/host/bench_regbuf.c`, kept in the regression as `REGBUF_TEST PASS`).
+
+Correctness: `GGML_CDSP_NO_CACHE=1` produces the same text as the cached path,
+so there is no stale-cache bug; but greedy decoding diverges from CPU after
+~10 tokens because the 135M model's narrow logit margins let the ~0.4–0.7%
+int8 error flip an argmax. **Not bit-exact on small models**, though the text
+remains fluent.
+
+Practical takeaway: for SmolLM2-135M the best cDSP config is
+`MIN_ELEMS=500000 MAX_ELEMS=2000000` (FFN only), and the CPU is still 3.4×
+faster. What matters is how much compute amortizes each cross-backend split,
+not whether the weights fit in DSP memory.
+
 ---
 
 ## 5. Troubleshooting
@@ -216,6 +287,9 @@ more than the RPC they save.
 | `Compute error` from DSP | `systemctl restart cdsprpcd` and confirm `/usr/lib/rfsa/cdsp/libgemm_skel.so` is the current build |
 | `cdsp_gemm_open` returns `-1` / `0x8000041d` after a killed run | the cDSP subsystem has crashed. Check `cat /sys/class/remoteproc/remoteproc1/state` → `crashed` and `dmesg` for `qcom_q6v5_pas ... fatal error received`. Writing `stop`/`start` to that sysfs node does **not** recover it; use **`systemctl reboot`** (never `kexec`). Killing `llama-cli` with `kill -9` mid-FastRPC is one trigger — prefer the built-in `timeout` wrapper and let it exit cleanly |
 | `0.0 t/s` + `Error: Compute error` with no kill involved | **cDSP watchdog** after many consecutive long runs: `dmesg` shows `SFR Init: wdog or kernel error suspected` / `remoteproc1: crash detected in cdsp`. Seen after 8+ back-to-back 48-token runs. Same recovery (`systemctl reboot`, ~50 s over USB-NCM), then let the phone cool. `llama_diag.py` now checks `remoteproc1/state` before every run and refuses to report a meaningless benchmark when it is `crashed` |
+| `error: invalid argument: C:/Program Files/.../root/models/x.gguf` | Git Bash/MSYS rewrote the absolute device path. Pass a **bare filename** to `--model` (`smollm2-135m-q4_k_m.gguf`); the driver resolves it under `/root/models` |
+| Small-model output differs from CPU after ~10 tokens (greedy) | expected: per-vector int8 error flips narrow-margin argmaxes on a 135M model. Not a bug; use `--temp 0` and compare a prefix, or use `GGML_CDSP_NO_CACHE=1` to rule out stale cache. See §4.2 |
+| `fastrpc_mmap` / `remote_register_buf` returns `20` | `AEE_EUNSUPPORTED` on this kernel (dmesg `mem mmap error`). Persistent mapping is unavailable and plain RPCMEM is slower than `malloc` — do not retry; see `src/host/bench_regbuf.c` and `docs/next-steps.md` §5.3 |
 
 To attribute an accuracy regression, run the same prompt with
 `GGML_CDSP_HOST_F32=1` (exact host F32 GEMM). If that is coherent but the

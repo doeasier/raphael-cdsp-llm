@@ -1,0 +1,20 @@
+MODE       : cpu
+MODEL      : /root/models/smollm2-135m-q4_k_m.gguf
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 123.2 t/s | Generation: 81.2 t/s 
+--- OUTPUT ---
+> The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The capital of France is
+The
+[ Prompt: 123.2 t/s | Generation: 81.2 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_cpu.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_cpu.host.log

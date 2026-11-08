@@ -1,0 +1,56 @@
+RC=0
+load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+load_backend: loaded cdsp backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+[cdsp-preload] registered cDSP backend from /data/local/tmp/ggml-backend/libggml-cdsp.so
+
+
+Loading model... |-\|/-\|/-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b0-unknown
+model      : /root/models/smollm2-135m-q4_k_m.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> The capital of France is
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The capital of France is
+
+The
+
+[ Prompt: 47.1 t/s | Generation: 23.8 t/s ]
+
+
+Exiting...

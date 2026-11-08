@@ -1,4 +1,4 @@
-# src/host — AP-side GEMM correctness + throughput tests (Stage 1/5/6/7)
+# src/host — AP-side GEMM correctness + throughput tests (Stage 1/5/6/7/8)
 
 `host_test.c` generates random int8 `A(M×K)`, `B(K×N)`, dispatches the GEMM to the
 cDSP over FastRPC, and verifies `C == reference(A·B)` on the host. Also reports
@@ -20,6 +20,15 @@ reports the 2-RPC → 1-RPC latency. Typical result: `2.505 → 1.962 ms (−21.
 effective GMAC/s. A `1×32×4` shape measures the bare FastRPC round-trip. Every
 run also spot-checks one output element against a scalar reference.
 
+`bench_regbuf.c` is the **Stage 8** RPC-buffer feasibility probe. It uploads one
+weight and times the same `gemm_compute_cached` with three A/C buffer
+strategies: plain `malloc` (current backend), `rpcmem_alloc_def` (DMA-BUF), and
+RPCMEM + persistent `fastrpc_mmap(FASTRPC_MAP_STATIC)`. On this device the
+persistent mapping returns `AEE_EUNSUPPORTED (0x14)` (kernel `mem mmap error`)
+and RPCMEM is 1.6–36.6% *slower* than `malloc`, so this is a recorded
+**negative result** — the plain heap buffers stay. Kept in
+`deploy_cdsp_gemm.py` as `REGBUF_TEST PASS` so it stays reproducible.
+
 Build + run on the device (the deploy script does this for you):
 
 ```bash
@@ -36,10 +45,14 @@ gcc -O2 -I. -Igen -I/usr/local/include/fastrpc \
 gcc -O2 -I. -Igen -I/usr/local/include/fastrpc \
     bench_cached.c gen/cdsp_gemm_stub.c -o bench_cached \
     -L/usr/local/lib -ladsprpc -lpthread -ldl
+gcc -O2 -I. -Igen -I/usr/local/include/fastrpc \
+    bench_regbuf.c gen/cdsp_gemm_stub.c -o bench_regbuf \
+    -L/usr/local/lib -ladsprpc -lpthread -ldl
 ./host_test 32 128 128                 # M N K  (one-shot)
 ./host_test_cached 1 11008 4096         # M N K  (weight-cache)
 ./host_test_batch 30                    # iterations (batched RPC)
 ./bench_cached 128 512 512 200         # M N K iters (warm-up / throughput)
+./bench_regbuf 1 576 1536 120          # M N K iters (buffer strategies)
 ```
 
 Exit 0 + `host: PASS - all N elements verified correct.` means the DSP kernel is

@@ -23,6 +23,7 @@ eXtensions).
 | 5 | Weight-cache RPC: upload weights once, reuse handle | `test_cache` `CACHE_TEST PASS`; decode 1×11008×4096 drops 762 ms → **37 ms/token** |
 | 6 | HVX peak tuning + real llama.cpp inference | 3-path kernel (up to **32.2 GMAC/s**); `Qwen3.5-4B-Q4_K_M` runs end-to-end with coherent output at ~94% of CPU tokens/s |
 | 7 | Batched RPC: one FastRPC call per scheduler split | `BATCH_TEST PASS` (1056 elements); **−21.6% RPC latency**, 78–198 round-trips removed per run. End-to-end tokens/s unchanged — see §4.1 |
+| 8 | Small-model benchmark: does cache residency let cDSP beat CPU? | **No.** `SmolLM2-135M` weights fit entirely (42 MB, zero thrash) yet cDSP is only **29% of CPU**; quantified with `GGML_CDSP_PROFILE`, split stats and a zero-copy feasibility probe |
 
 **Measured results (K20 Pro cDSP, HVX):**
 
@@ -98,6 +99,27 @@ Batch mode is **opt-in**; the recommended config is unchanged. Details and the
 ordering-bias analysis: [docs/llama-integration.md §4.1](docs/llama-integration.md),
 [docs/next-steps.md §4](docs/next-steps.md), `evidence/stage7-*`.
 
+**Stage 8 — small-model benchmark (`smollm2-135m-q4_k_m.gguf`, 64 tokens):**
+
+| Configuration | Prompt | Generation | vs CPU |
+|---|---|---|---|
+| CPU only | 123.2 t/s | **81.2 t/s** | 100% |
+| cDSP, best (`MIN=500000 MAX=2000000`, FFN only) | 47.1 t/s | **23.8 t/s** | **29%** |
+| cDSP, full offload (`MIN=0 MAX=0`) | 44.3 t/s | 13.4 t/s | 17% |
+
+This **falsifies the "weights fit in cache → cDSP wins" hypothesis**: full
+offload holds all weights in **42 MB (1984 hits / 31 misses, zero thrash)** and
+is still 3.4× slower than four CPU threads. `GGML_CDSP_PROFILE=1` attributes
+59.5% of backend time to FastRPC (1.113 ms/op); ~24 ms/token is spent outside
+the backend on CPU↔ACCEL split synchronization; and all 2015 scheduler splits
+contain exactly **one** `MUL_MAT`, so Stage 7 batching cannot help here.
+Persistent zero-copy is unavailable on this kernel (`fastrpc_mmap` →
+`AEE_EUNSUPPORTED`, RPCMEM slower than `malloc`; `src/host/bench_regbuf.c`).
+The cDSP path is also **not bit-exact** on a 135M model — greedy output
+diverges from CPU after ~10 tokens due to narrow logit margins. Details:
+[docs/next-steps.md §5](docs/next-steps.md),
+[docs/llama-integration.md §4.2](docs/llama-integration.md), `evidence/stage8-*`.
+
 ---
 
 ## Architecture
@@ -159,7 +181,7 @@ flowchart LR
     A25["Stage 2.5<br/>test_sched<br/>scheduler offload<br/>SCHED_TEST PASS"] --> A5
     A5["Stage 5<br/>weight-cache RPC<br/>upload once, reuse handle<br/>CACHE_TEST PASS"] --> A6
     A6["Stage 6<br/>3-path HVX kernel +<br/>LD_PRELOAD shim +<br/>real llama.cpp inference<br/>32.2 GMAC/s, coherent output"] --> A7
-    A7["Stage 7<br/>batched RPC per split<br/>BATCH_TEST PASS<br/>−21.6% RPC latency"] --> NX["Next:<br/>small-model benchmark<br/>+ weight staging"]
+    A7["Stage 7<br/>batched RPC per split<br/>BATCH_TEST PASS<br/>−21.6% RPC latency"] --> A8["Stage 8<br/>small-model benchmark<br/>42 MB cache, zero thrash<br/>still only 29% of CPU"] --> NX["Next:<br/>fuse a whole layer<br/>into one split<br/>(architectural)"]
 ```
 
 See [docs/reproduce.md](docs/reproduce.md) for the exact commands.
@@ -180,13 +202,14 @@ raphael-cdsp-llm/
 │   │   ├── gemm_dsp.c        #   HVX int8 GEMM (3 paths) + batched compute
 │   │   ├── build_win.sh      #   Hexagon SDK build -> prebuilt/libgemm_skel.so
 │   │   └── AEEStdDef.h, AEEStdErr.h
-│   ├── host/                 # Stage 1/5/6/7: AP-side correctness + perf
+│   ├── host/                 # Stage 1/5/6/7/8: AP-side correctness + perf
 │   │   ├── host_test.c       #   one-shot int8 GEMM -> verify + time
 │   │   ├── host_test_cached.c#   weight-cache API test (upload/compute/release)
 │   │   ├── host_test_batch.c #   Stage 7 batched RPC correctness + latency
-│   │   └── bench_cached.c    #   Stage 6 HVX microbenchmark (ms/call, GMAC/s)
-│   ├── ggml-backend/         # Stage 2/2.5/5/6/7: ggml backend plugin
-│   │   ├── ggml-cdsp.cpp     #   registration + MUL_MAT + LRU cache + split batching
+│   │   ├── bench_cached.c    #   Stage 6 HVX microbenchmark (ms/call, GMAC/s)
+│   │   └── bench_regbuf.c    #   Stage 8 RPC buffer strategies (negative result)
+│   ├── ggml-backend/         # Stage 2/2.5/5/6/7/8: ggml backend plugin
+│   │   ├── ggml-cdsp.cpp     #   registration + MUL_MAT + LRU cache + batch + PROFILE
 │   │   ├── cdsp_gemm_host.{h,cpp}  # FastRPC session wrapper (+ cache/batch API)
 │   │   ├── ggml-backend-impl.h      # ABI pin (copied from ggml 0.9.0)
 │   │   ├── cdsp_preload.c    #   LD_PRELOAD shim for GGML_BACKEND_DL=OFF builds
@@ -205,18 +228,20 @@ raphael-cdsp-llm/
 │   └── ggml-0.9.0-headers/   # ggml public headers (build dependency)
 ├── scripts/device/
 │   ├── k20_ssh.py            # USB-NCM SSH/SFTP helper (root@172.16.42.1)
-│   ├── deploy_cdsp_gemm.py   # Stage 1 + 5 + 6 bench + 7 batch deploy/tests
+│   ├── deploy_cdsp_gemm.py   # Stage 1 + 5 + 6 bench + 7 batch + 8 regbuf
 │   ├── deploy_ggml_cdsp.py   # Stage 2/2.5/5/6 deploy + tests
-│   └── llama_diag.py         # llama-cli driver (modes, --env, --seed, DSP precheck)
+│   └── llama_diag.py         # llama-cli driver (modes, --model, --env, --seed, DSP precheck)
 ├── evidence/
 │   ├── stage6-*.txt          # Stage 6 regression (9/9 + 5/5 PASS)
 │   ├── stage7-*.txt          # Stage 7 regression (10/10 + 5/5 PASS)
-│   └── stage7-ab/            # deterministic A/B logs (thermal-bias analysis)
+│   ├── stage7-ab/            # deterministic A/B logs (thermal-bias analysis)
+│   ├── stage8-*-regression.txt# Stage 8 regression (21/21 + 5/5 PASS, REGBUF_TEST)
+│   └── stage8/               # small-model CPU/cDSP correctness + timing logs
 └── docs/
     ├── architecture.md        # detailed architecture + HVX kernel notes
     ├── reproduce.md           # step-by-step reproduction
     ├── llama-integration.md   # llama-cli recipe, env vars, batch A/B, troubleshooting
-    └── next-steps.md          # Stage 5/6/7 results, roofline, remaining work
+    └── next-steps.md          # Stage 5/6/7/8 results, roofline, remaining work
 ```
 
 ---
@@ -259,12 +284,13 @@ cd raphael-cdsp-llm
 # Requires Qualcomm Hexagon SDK 4.3.0.0 on Windows:
 cd src/dsp && bash build_win.sh && cd ../..
 
-# Stage 1 + 5 + 6 bench + 7 batch — install the skel, verify the GEMM kernel
-# (weight-cache test, batched RPC test, HVX throughput microbenchmark)
+# Stage 1 + 5 + 6 bench + 7 batch + 8 regbuf — install the skel, verify all
+# kernels (weight cache, batched RPC, HVX throughput, RPC buffer strategies)
 python3 scripts/device/deploy_cdsp_gemm.py
 #   -> host: PASS - all 4096 elements verified correct.
 #   -> host_test_cached: PASS  (decode 1x11008x4096: 672 ms upload, 37 ms/token)
 #   -> host_test_batch: BATCH_TEST PASS, batched 1 RPC 21.6% faster than 2 RPCs
+#   -> REGBUF_TEST PASS (fastrpc_mmap unsupported, malloc is fastest)
 #   -> BENCH M=128 N=512 K=512 ... 32.2 GMAC/s ... verify=PASS
 
 # Stage 2 + 2.5 + 5 + 6 — build the ggml backend, run all tests on the phone
@@ -285,6 +311,16 @@ python3 scripts/device/llama_diag.py normal --tokens 48 --no-debug \
     --seed 42 --temp 0 --min-elems 100000 --max-elems 3000000 \
     --env "GGML_CDSP_BATCH=1 GGML_CDSP_SPLIT_STATS=1"
 #   -> [cdsp-batch] splits=150 ops=300 rpcs_saved=150, identical generated text
+
+# Stage 8 — small model (put smollm2-135m-q4_k_m.gguf in /root/models first)
+python3 scripts/device/llama_diag.py cpu --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0
+python3 scripts/device/llama_diag.py normal --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0 \
+    --min-elems 500000 --max-elems 2000000 \
+    --env "GGML_CDSP_PROFILE=1 GGML_CDSP_SPLIT_STATS=1"
+#   -> CPU 81.2 t/s vs cDSP 23.8 t/s; [cdsp-prof] rpc=59.5%, 1.113 ms/op
+#   -> [cdsp-split] 2015 splits, 0 with >1 MUL_MAT (batching cannot help)
 ```
 
 That is the whole proof. For the full walkthrough (env setup, expected log

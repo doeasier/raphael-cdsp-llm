@@ -1,0 +1,26 @@
+MODE       : cpu
+MODEL      : /root/models/smollm2-135m-q4_k_m.gguf
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 129.7 t/s | Generation: 78.3 t/s 
+--- OUTPUT ---
+> Once upon a time in a small village
+was a woman
+who was
+in the army
+for four years and
+a half
+in the
+warship
+that had
+to be
+for the
+war
+was
+the
+navy
+was
+the
+[ Prompt: 129.7 t/s | Generation: 78.3 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_cpu.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_cpu.host.log

@@ -12,6 +12,9 @@ What it does:
   6. Run bench_cached (Stage 6 HVX microbenchmark): FastRPC ping, decode,
      square and prompt-batch shapes, with a DSP warm-up pass to avoid DVFS
      cold-clock numbers. Reports ms/call and effective GMAC/s.
+  7. Run bench_regbuf (Stage 8): compare plain-malloc, RPCMEM and persistent
+     fastrpc_mmap A/C buffers. On this kernel mmap is UNSUPPORTED and RPCMEM
+     is slower, so this is a recorded negative result, not a failure.
 
 The DSP .so is built on Windows beforehand via src/dsp/build_win.sh
 (or use the committed prebuilt/libgemm_skel.so).
@@ -41,6 +44,7 @@ LOCAL_FILES = [
     (os.path.join(SRC_HOST, "host_test_cached.c"), "host_test_cached.c"),
     (os.path.join(SRC_HOST, "host_test_batch.c"),  "host_test_batch.c"),
     (os.path.join(SRC_HOST, "bench_cached.c"),     "bench_cached.c"),
+    (os.path.join(SRC_HOST, "bench_regbuf.c"),     "bench_regbuf.c"),
     (os.path.join(GEN_DIR,  "gemm.h"),             "gen/gemm.h"),
     (os.path.join(GEN_DIR,  "cdsp_gemm_stub.c"),   "gen/cdsp_gemm_stub.c"),
     (os.path.join(SRC_DSP,  "AEEStdDef.h"),        "AEEStdDef.h"),
@@ -99,6 +103,9 @@ def main():
         "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
         "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
         "bench_cached.c gen/cdsp_gemm_stub.c -o bench_cached "
+        "-L/usr/local/lib -ladsprpc -lpthread -ldl && "
+        "gcc -O2 -I. -Igen -I/usr/local/include/fastrpc "
+        "bench_regbuf.c gen/cdsp_gemm_stub.c -o bench_regbuf "
         "-L/usr/local/lib -ladsprpc -lpthread -ldl"
     )
     out, err, st = run(c, compile_cmd, timeout=120)
@@ -163,6 +170,20 @@ def main():
         print(out.strip())
         if err:
             print("STDERR:", err)
+
+    # Stage 8: RPC buffer strategy. Persistent fastrpc_mmap is NOT supported
+    # by this device's kernel (AEE_EUNSUPPORTED / "mem mmap error" in dmesg)
+    # and plain RPCMEM is ~37% SLOWER than malloc. Keep the measurement in the
+    # regression log so the negative result is reproducible and not retried.
+    print("\n=== bench_regbuf (Stage 8 RPC buffer strategies) ===")
+    out, err, st = run(c, f"cd {DEVICE_DIR} && ./bench_regbuf 1 576 1536 120",
+                       timeout=240)
+    print(out.strip())
+    if err:
+        print("STDERR:", err)
+    rb_ok = (st == 0 and "REGBUF mode=0" in out and "REGBUF mode=1" in out
+             and out.count("verify=PASS") >= 2)
+    print("REGBUF_TEST PASS" if rb_ok else "REGBUF_TEST FAIL")
 
     c.close()
 

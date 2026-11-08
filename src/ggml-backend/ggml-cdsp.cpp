@@ -40,6 +40,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdlib>
 #include <climits>
+#include <ctime>
 #include <vector>
 #include <unordered_map>
 
@@ -280,6 +281,38 @@ static bool cdsp_can_mul_mat(const struct ggml_tensor * op) {
 }
 
 // ---------------------------------------------------------------------------
+// Optional per-stage profiling (Stage 8 small-model investigation).
+//
+// Enable with GGML_CDSP_PROFILE=1. Splits each offloaded MUL_MAT into four
+// stages so the end-to-end cost can be attributed without attaching a profiler
+// to the phone. Printed at .so unload so the normal log stays clean.
+// ---------------------------------------------------------------------------
+static const bool g_prof_on = getenv("GGML_CDSP_PROFILE") != nullptr;
+static uint64_t   g_prof_ops = 0;
+static double g_prof_weight = 0, g_prof_qa = 0, g_prof_rpc = 0, g_prof_resc = 0;
+
+static inline double prof_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+__attribute__((destructor))
+static void cdsp_prof_dump(void) {
+    if (!g_prof_on || g_prof_ops == 0) return;
+    const double tot = g_prof_weight + g_prof_qa + g_prof_rpc + g_prof_resc;
+    fprintf(stderr,
+            "[cdsp-prof] ops=%llu total=%.1f ms (%.3f ms/op) | "
+            "weight=%.1f (%.1f%%) quant_A=%.1f (%.1f%%) "
+            "rpc=%.1f (%.1f%%) rescale=%.1f (%.1f%%)\n",
+            (unsigned long long)g_prof_ops, tot, tot / (double)g_prof_ops,
+            g_prof_weight, 100.0 * g_prof_weight / tot,
+            g_prof_qa,     100.0 * g_prof_qa      / tot,
+            g_prof_rpc,    100.0 * g_prof_rpc     / tot,
+            g_prof_resc,   100.0 * g_prof_resc    / tot);
+}
+
+// ---------------------------------------------------------------------------
 // the actual MUL_MAT compute, dispatched to the cDSP
 // ---------------------------------------------------------------------------
 static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
@@ -376,6 +409,7 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
         const uint8_t * Wb  = W  + b1 * wbatch;
         float         * Cb  = C  + b * M * N;
 
+        double p0 = g_prof_on ? prof_now_ms() : 0.0;
         // ---- weight cache lookup (keyed by pointer + in-tensor batch) ----
         // GGML_CDSP_NO_CACHE bypasses the cache entirely: upload every time,
         // release immediately. Useful to detect STALE cache entries, i.e. a
@@ -430,6 +464,10 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
             g_wcache_hits++;
             pcw = &it->second;
         }
+        if (g_prof_on) {
+            g_prof_weight += prof_now_ms() - p0;   // cache lookup / miss build
+            p0 = prof_now_ms();
+        }
         pcw->last = ++g_wcache_tick;
         const CachedWeight & cw = *pcw;
 
@@ -437,6 +475,10 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
         for (int64_t m = 0; m < M; m++)
             quant_vec(Ab + m * K, (int)K, Aq.data() + m * K, &sA[m]);
 
+        if (g_prof_on) {
+            g_prof_qa += prof_now_ms() - p0;
+            p0 = prof_now_ms();
+        }
         // 6. DSP int8 GEMM via cached weight: C32 = Aq @ cached B (only A sent)
         std::vector<int32_t> C32((size_t)M * N);
         int rc = cdsp_gemm_compute_cached(Aq.data(), (int)M, (int)K, (int)N,
@@ -446,12 +488,20 @@ static enum ggml_status cdsp_mul_mat(struct ggml_tensor * dst) {
             return GGML_STATUS_FAILED;
         }
 
+        if (g_prof_on) {
+            g_prof_rpc += prof_now_ms() - p0;
+            p0 = prof_now_ms();
+        }
         // 7. recover F32: C[m][n] = sA[m] * sB[n] * C32[m][n]
         for (int64_t m = 0; m < M; m++)
             for (int64_t n = 0; n < N; n++)
                 Cb[(size_t)m * N + n] =
                     sA[m] * cw.sB[n] * (float)C32[(size_t)m * N + n];
 
+        if (g_prof_on) {
+            g_prof_resc += prof_now_ms() - p0;
+            g_prof_ops++;
+        }
         // In diagnostic no-cache mode `local` is a stack entry not owned by
         // g_wcache, so release its DSP handle explicitly here (otherwise every
         // offloaded MUL_MAT leaks one prepacked weight buffer on the cDSP).

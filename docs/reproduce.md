@@ -310,6 +310,62 @@ even with clean exits (`SFR Init: wdog or kernel error suspected`), producing
 `0.0 t/s`. `llama_diag.py` checks `remoteproc1/state` before each run; recover
 with `systemctl reboot` and let the phone cool.
 
+### 5.5 Stage 8 — small-model benchmark (SmolLM2-135M)
+
+#### Getting the model onto the phone
+
+`smollm2-135m-q4_k_m.gguf` (101 MB, sha256
+`3dac8a6535e754df3da638794da83508b748bb31c4100499a392173d17cb695a`) is a 30-layer
+llama model (emb 576, FFN 1536, vocab 49152) whose int8 weights fit entirely in
+the 256 MB cache. **Do not use SFTP for a 100 MB file over this USB-NCM link** —
+large transfers stall and exhaust sshd sessions. Use a temporary HTTP server on
+the Windows host instead:
+
+```bash
+# host (Git Bash). The phone sees the host as 172.16.42.2 (`cat /proc/net/arp`).
+cd /f/work/WorkBuddy/k20pro/downloads/models
+python -m http.server 8765 --bind 0.0.0.0
+
+# device (separate SSH session)
+curl -sS -C - -o /root/models/smollm2-135m-q4_k_m.gguf \
+    http://172.16.42.2:8765/smollm2-135m-q4_k_m.gguf
+sha256sum /root/models/smollm2-135m-q4_k_m.gguf   # must match the above
+```
+
+Stop the server when finished. The device has no internet access, but the
+USB-NCM link carries HTTP fine.
+
+#### Running the comparison
+
+`llama_diag.py` accepts a **bare GGUF filename** (`--model`), resolves it under
+`/root/models`, and additionally supports `--cache-mb` and `--threads`:
+
+```bash
+python3 scripts/device/llama_diag.py cpu --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0
+python3 scripts/device/llama_diag.py normal --model smollm2-135m-q4_k_m.gguf \
+    --tokens 64 --no-debug --seed 42 --temp 0 \
+    --min-elems 500000 --max-elems 2000000 \
+    --env "GGML_CDSP_PROFILE=1 GGML_CDSP_SPLIT_STATS=1"
+```
+
+Passing an absolute device path such as `/root/models/x.gguf` from Git Bash is
+rewritten by MSYS into `C:/Program Files/.../root/models/x.gguf`; the driver now
+detects and rejects that with a clear message. Always use the bare filename.
+
+Expected (clean state after `systemctl reboot`): CPU **81.2 t/s**, best cDSP
+**23.8 t/s**, full offload 13.4 t/s. `[cdsp-prof]` shows FastRPC at 1.113 ms/op
+(59.5%) and `[cdsp-split]` shows 2015 splits with **0** multi-matmul splits.
+`deploy_cdsp_gemm.py` also runs `bench_regbuf.c`, which confirms that
+`fastrpc_mmap` is unsupported on this kernel and that RPCMEM is slower than
+`malloc` (`REGBUF_TEST PASS`).
+
+Greedy-decoding output diverges from CPU after ~10 tokens on this small model;
+that is int8 quantization error flipping narrow-margin argmaxes, not a bug.
+`GGML_CDSP_NO_CACHE=1` reproduces the normal path's text, ruling out stale
+cache. Full analysis: [next-steps.md](next-steps.md) §5,
+[llama-integration.md](llama-integration.md) §4.2.
+
 ---
 
 ## 6. Troubleshooting
@@ -329,25 +385,33 @@ with `systemctl reboot` and let the phone cool.
 | Benchmark numbers 30–50% low | cDSP DVFS cold clock | run a 200-iteration warm-up shape first (`deploy_cdsp_gemm.py` does this) |
 | `0.0 t/s` + `Error: Compute error`, no `kill -9` involved | cDSP **watchdog** after 8+ consecutive long runs (`SFR Init: wdog or kernel error suspected`; `remoteproc1=crashed`) | `systemctl reboot` (never `kexec`), then let the device cool. `llama_diag.py` pre-checks the remoteproc state and refuses to benchmark a crashed DSP |
 | A/B results where "whichever ran first" is faster | thermal throttling, not a real speedup | use `--seed 42 --temp 0` and an ABBA run order (on/off/off/on) to cancel the linear trend |
+| `error: invalid argument: C:/Program Files/.../root/models/x.gguf` | MSYS/Git Bash rewrote the absolute device path | pass a **bare filename** to `--model` (§5.5) |
+| Large GGUF upload stalls / sshd sessions time out | SFTP over USB-NCM is unreliable for big files | serve the file over HTTP from the host and `curl -C -` on the device (§5.5) |
+| `fastrpc_mmap` returns `20` / dmesg `mem mmap error` | `AEE_EUNSUPPORTED` on this kernel | persistent mapping is unavailable; RPCMEM buffers are slower than `malloc`. Do not retry — see `src/host/bench_regbuf.c` and next-steps.md §5.3 |
+| Small-model output differs from CPU after ~10 greedy tokens | int8 error flips narrow logit margins | expected, not bit-exact; use `GGML_CDSP_NO_CACHE=1` to rule out stale cache (§5.5) |
 
 ---
 
 ## 7. What is NOT done yet
 
-Stages 0–7 are implemented and verified. Batched RPC (the former top priority)
-is **done** — it removes 78–198 FastRPC round-trips per run and cuts RPC-pair
-latency by 21.6%, but does **not** improve end-to-end tokens/s
-([next-steps.md](next-steps.md) §4). Remaining work, in priority order:
+Stages 0–8 are implemented and verified. Batched RPC (§4 of next-steps.md) is
+**done** — 21.6% lower RPC-pair latency but no end-to-end win. The small-model
+benchmark (§5) is also **done**: SmolLM2-135M keeps all weights in the cache
+(42 MB, zero thrash) yet reaches only 29% of CPU tokens/s, falsifying the
+cache-residency hypothesis. Remaining work, in priority order:
 
-- **Small-model benchmark.** A model whose int8 weights fit the 256 MB cache is
-  where the backend should actually beat the CPU; not yet measured. The phone
-  currently only has the 2.74 GB `Qwen3.5-4B-Q4_K_M.gguf`.
+- **Remove split boundaries, not RPCs.** ~24 ms/token is spent in CPU↔ACCEL
+  scheduler synchronization on the 135M model. Getting several consecutive
+  matmuls into one split requires DSP implementations of RMSNorm/RoPE/SiLU/
+  softmax or a fused whole-layer FastRPC call — an architectural change, not
+  another backend tweak.
 - **Weight staging for large models.** The 256 MB cache cannot hold a 4B model
-  as int8, so only small/medium matrices are offloaded; the large FFN GEMMs
-  stay on the CPU. Streaming tiles from AP memory is the next structural step.
-- **Change the decode dataflow.** M=1 decode is 1 byte/MAC memory-bound; TCM
-  residency or cross-token batching, not more HVX unrolling.
-- **Fuse the output rescale** on the DSP, and use better-than-per-vector int8
-  quantization (currently ~0.4–0.7% relative error per layer).
+  as int8, so the large FFN GEMMs stay on the CPU. Streaming tiles from AP
+  memory is the next structural step.
+- **Better-than-per-vector int8 quantization** (per-block / per-K group) to fix
+  the small-model divergence; correctness, not throughput.
+- **Fuse the output rescale on the DSP.** `GGML_CDSP_PROFILE` shows it is only
+  0.8% of backend time, so it is worth doing only as part of a larger fusion.
 - Only `GGML_OP_MUL_MAT` is offloaded; all other ops run on the CPU. By design
-  for this PoC.
+  for this PoC. Stages 6–8 establish a consistent measured negative result for
+  single-operator offload at both 135M and 4B scales.

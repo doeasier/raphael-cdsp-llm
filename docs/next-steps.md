@@ -3,7 +3,10 @@
 Stages 0–5 implemented and verified the transport path. **Stage 6** closed
 §2 HVX peak tuning and §3 real llama.cpp inference. **Stage 7** closed the
 former top priority, batched RPC (§4) — with a deliberately honest negative
-end-to-end result. Everything below records the measurements and what remains.
+end-to-end result. **Stage 8** ran the small-model benchmark (§5) and
+**falsified the cache-residency hypothesis**: even a model whose int8 weights
+fit entirely in the cDSP cache is ~3.4× slower than the CPU. Everything below
+records the measurements and what remains.
 
 ---
 
@@ -186,27 +189,126 @@ Full measurements and the ordering-bias analysis: `docs/llama-integration.md`
 
 ---
 
-## 5. What remains (in priority order)
+## 5. Small-model benchmark — DONE (Stage 8), hypothesis FALSIFIED
 
-1. **Small-model benchmark.** A model whose int8 weights fit the 256 MB cache
-   is where this backend should actually beat the CPU; that measurement is
-   still open and is now the highest-value experiment. The device currently
-   only has `Qwen3.5-4B-Q4_K_M.gguf` (2.74 GB).
-2. **Weight staging for large models** (§1.1): keep packed weights on the AP,
-   stream tiles to the DSP, amortize per-tile rather than per-layer. Needed
-   before FFN matrices can be offloaded for a 4B model.
-3. **Change the decode dataflow.** More HVX unrolling cannot help: M=1 decode
-   is 1 byte/MAC memory-bound. Keeping packed weights in TCM or batching
-   *across tokens* are the remaining structural options.
-4. **Fuse the output rescale.** The host still multiplies each result by
-   `sA[m] * sB[n]`; doing this on the DSP with a fixed-point scale would remove
-   one host pass per op.
-5. **Better quantization** than symmetric per-vector int8 (per-block / per-K
-   group) to reduce the ~0.4–0.7% per-layer error.
+The previously highest-priority experiment asked: *if the int8 weights fit in
+the 256 MB cache, does the cDSP finally beat the CPU?* Model used:
+**`smollm2-135m-q4_k_m.gguf`** (101 MB GGUF, llama arch, 30 layers, emb 576,
+FFN 1536, vocab 49152), transferred over USB-NCM via a temporary HTTP server
+(see `docs/reproduce.md` §4). All runs use `--seed 42 --temp 0 --no-debug`,
+64 tokens, clean device state after `systemctl reboot`.
+
+### 5.1 Headline result: no, it does not
+
+| Configuration | Prompt | Generation | vs CPU |
+|---|---|---|---|
+| **CPU only** | 123.2 t/s | **81.2 t/s** | 100% |
+| cDSP, best (`MIN=500000 MAX=2000000`, FFN only) | 47.1 t/s | **23.8 t/s** | **29%** |
+| cDSP, full offload (`MIN=0 MAX=0`) | 44.3 t/s | **13.4 t/s** | 17% |
+| cDSP, `GGML_CDSP_BATCH=1` | 48.7 t/s | 19.0 t/s | no gain |
+| cDSP, `GGML_CDSP_NO_CACHE=1` | 17.4 t/s | 1.4 t/s | 17.6× cache value |
+
+**The cache-capacity hypothesis is falsified.** The weights really do all fit:
+full offload reported `cache hits=1984 misses=31 bytes=44015616` (**42 MB**,
+zero thrash) — exactly the scenario Stage 6 predicted would win. It is still
+3.4× slower than four CPU threads. Caching is necessary but nowhere near
+sufficient.
+
+### 5.2 Where the time actually goes
+
+`GGML_CDSP_SPLIT_STATS=1` on this model: **2015 splits / 2015 MUL_MAT nodes /
+0 splits with >1 matmul**. Unlike Qwen3.5-4B (37.5% multi-matmul splits), the
+135M graph is a strictly serial chain of CPU-only ops (RMSNorm, RoPE, softmax,
+SiLU) between matmuls, so **Stage 7 batching has nothing to merge here**.
+Offload shapes: 1008× `1×576×1536`, 882× `1×192×576`, 65× `1×49152×576`.
+
+`GGML_CDSP_PROFILE=1` splits each offloaded MUL_MAT into four host-side stages
+(1040 ops, best config):
+
+| Stage | Total | Share | Per op |
+|---|---|---|---|
+| weight / cache (incl. 31 cold uploads) | 709.7 ms | 36.5% | — |
+| activation quantization | 62.3 ms | 3.2% | 0.060 ms |
+| **FastRPC + DSP GEMM** | **1157.1 ms** | **59.5%** | **1.113 ms** |
+| output rescale | 16.4 ms | 0.8% | 0.016 ms |
+| **total inside `cdsp_mul_mat`** | **1945.6 ms** | 100% | 1.871 ms |
+
+Steady state (excluding the one-off uploads) is ~1.19 ms/op, or ~19.3 ms of the
+43.3 ms/token the run actually took. The remaining **~24 ms/token is outside
+the backend**: ggml's multi-backend scheduler must switch CPU↔ACCEL for every
+split. Loading the backend with zero offloads (`MIN_ELEMS=100000000`) still
+gives 71.0 t/s vs CPU 80.6 t/s, so the overhead is not backend registration —
+it is the per-split synchronization that only happens when ops are offloaded.
+This also explains why saving round-trips inside a split (Stage 7) barely
+moved tokens/s: the expensive unit is the **split boundary**, not the RPC.
+
+### 5.3 Persistent zero-copy buffers — investigated, NOT viable here
+
+`src/host/bench_regbuf.c` times the same `gemm_compute_cached` with three A/C
+buffer strategies (`1 576 1536 120`):
+
+| Strategy | ms/call | Result |
+|---|---|---|
+| plain `malloc` (current backend) | **0.937–1.017** | fastest |
+| `rpcmem_alloc_def` (DMA-BUF) | 1.033–1.280 | **1.6–36.6% slower**, noisy |
+| RPCMEM + `fastrpc_mmap(FASTRPC_MAP_STATIC)` | — | **unsupported** |
+
+`fastrpc_mmap()` returns `20 = 0x14 = AEE_EUNSUPPORTED` and the kernel logs
+`qcom,fastrpc-cb ...: mem mmap error`. This device's fastrpc driver has no
+persistent mapping path. **Do not retry `remote_register_buf` / `fastrpc_mmap`
+on this kernel**; it is a driver capability gap, not an argument error. The
+benchmark is kept in the regression (`REGBUF_TEST PASS`) so the negative result
+stays reproducible.
+
+### 5.4 Numerical correctness on a small model
+
+`GGML_CDSP_NO_CACHE=1` produces **the same text as the normal cached path**, so
+stale cache entries (a worry from §3) are ruled out; the divergence from CPU is
+pure int8 quantization error. Under greedy decoding CPU and cDSP agree for the
+first ~10 tokens (`"The first time I saw the picture of the"`) and then branch;
+with `--temp 0.7` both continuations are fluent but different. A 135M model has
+much narrower logit margins than a 4B model, so the ~0.4–0.7% per-layer error
+can flip an argmax. **The backend is not bit-exact on small models**, although
+output remains coherent. Per-block/per-K-group quantization would address this,
+but would not change the speed conclusion.
+
+### 5.5 Conclusion
+
+What decides the winner is not cache residency but **how much compute amortizes
+each cross-backend boundary**. A 135M decode needs ~16–30 small GEMMs per token;
+each pays ~1.1 ms FastRPC plus ~0.7 ms scheduler synchronization, while four
+CPU threads finish the whole token in ~13 ms. The same structural reason makes
+the 4B model lose (there it is cache thrash plus the CPU-side large FFN). For
+both model scales tested, single-operator `MUL_MAT` offload to an ACCEL backend
+is the wrong granularity.
 
 ---
 
-## 6. Known limitations
+## 6. What remains (in priority order)
+
+1. **Remove split boundaries, not RPCs.** The only lever that touches the
+   ~24 ms/token scheduler overhead is getting several consecutive matmuls into
+   one ACCEL split — e.g. implementing RMSNorm/RoPE/SiLU/softmax as DSP kernels,
+   or fusing a whole transformer layer into one FastRPC call. This is a much
+   larger change than a backend plugin and is the honest "next project".
+2. **Weight staging / TCM residency for large models** (§1.1): keep packed
+   weights on the AP, stream tiles to the DSP, amortize per tile rather than
+   per layer. Needed before 4B FFN matrices can be offloaded.
+3. **Better quantization** (per-block / per-K group) to fix the §5.4 divergence
+   on narrow-margin models. Correctness, not throughput.
+4. **Fuse the output rescale on the DSP.** Profile says this can recover at most
+   0.8% of backend time — worth doing only as part of a larger DSP-side fusion.
+5. **Change the decode dataflow** (TCM-resident weights, cross-token batching):
+   M=1 decode remains 1 byte/MAC memory-bound, see §2.2.
+
+> **Scope note.** Stages 6–8 establish a consistent, measured negative result
+> for *single-operator offload* at 135M and 4B model scales. Further tuning of
+> the current backend is unlikely to beat the CPU; the remaining items above
+> are architectural, not incremental.
+
+---
+
+## 7. Known limitations
 
 - Only `GGML_OP_MUL_MAT` is offloaded; RoPE, RMSNorm, softmax and sampling stay
   on the CPU. By design for this PoC.
@@ -230,3 +332,10 @@ Full measurements and the ordering-bias analysis: `docs/llama-integration.md`
 - Sustained back-to-back llama-cli runs can trip the cDSP watchdog even with
   clean shutdowns (`SFR Init: wdog or kernel error suspected`). Only
   `systemctl reboot` clears a `crashed` remoteproc; sysfs stop/start does not.
+- Persistent FastRPC mappings are unavailable on this kernel
+  (`fastrpc_mmap` → `AEE_EUNSUPPORTED`, dmesg `mem mmap error`); plain
+  RPCMEM buffers are slower than `malloc`. See §5.3.
+- On small models the int8 path is **not bit-exact**: greedy decoding diverges
+  from CPU after ~10 tokens (§5.4).
+- Every offloaded `MUL_MAT` creates a CPU↔ACCEL scheduler split. On SmolLM2-135M
+  this costs ~24 ms/token outside the backend and dominates the outcome (§5.2).

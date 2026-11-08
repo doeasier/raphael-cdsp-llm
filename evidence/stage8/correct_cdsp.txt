@@ -1,0 +1,14 @@
+MODE       : normal
+MODEL      : /root/models/smollm2-135m-q4_k_m.gguf
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 49.3 t/s | Generation: 23.9 t/s 
+--- OUTPUT ---
+> Once upon a time in a small village
+one of the village's most important citizens, was a
+haughty old man who had been a member of the village council
+during the 19th century. He was a man who was quite
+intellectually gifted,
+[ Prompt: 49.3 t/s | Generation: 23.9 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_normal.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_normal.host.log

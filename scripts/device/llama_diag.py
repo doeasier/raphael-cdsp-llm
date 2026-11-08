@@ -12,6 +12,10 @@ Stage 7 additions: `--env` injects arbitrary switches (e.g.
 GGML_CDSP_BATCH=1 GGML_CDSP_SPLIT_STATS=1), `--seed` / `--temp` make sampling
 deterministic for a fair A/B, and a pre-flight check refuses to benchmark a
 crashed cDSP remoteproc (which would otherwise report a misleading 0.0 t/s).
+
+Stage 8 additions: `--model` selects another GGUF (a bare filename resolved
+under /root/models, avoiding MSYS path rewriting), `--cache-mb` overrides the
+DSP weight-cache size and `--threads` sets llama-cli's -t.
 """
 import argparse
 import os
@@ -34,6 +38,22 @@ MODES = {
 }
 
 
+def resolve_model(spec):
+    """Accept a bare GGUF filename (resolved under /root/models).
+
+    Git Bash on Windows silently rewrites a leading '/root/...' argument into
+    an MSYS Windows path (e.g. C:/Program Files/.../root/models/...), which
+    then reaches llama-cli as garbage. A bare filename avoids that conversion.
+    """
+    if spec.startswith("/"):
+        return spec                       # already a device-absolute path
+    if os.path.isabs(spec):
+        raise SystemExit(
+            "model path was rewritten by MSYS (%s); pass a bare filename "
+            "like 'smollm2-135m-q4_k_m.gguf' instead" % spec)
+    return "/root/models/" + spec
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=list(MODES))
@@ -50,7 +70,14 @@ def main():
                     help="fixed RNG seed for deterministic A/B (-1 = random)")
     ap.add_argument("--temp", default=None,
                     help="sampling temperature, e.g. 0 for greedy decoding")
+    ap.add_argument("--model", default=os.path.basename(MDL),
+                    help="GGUF filename in /root/models, or a device-absolute path")
+    ap.add_argument("--cache-mb", default=None,
+                    help="override GGML_CDSP_CACHE_MB (default 256 on device)")
+    ap.add_argument("--threads", type=int, default=4,
+                    help="llama-cli -t value")
     a = ap.parse_args()
+    model = resolve_model(a.model)
 
     sampling = ""
     if a.seed >= 0:
@@ -60,6 +87,7 @@ def main():
 
     log = "/data/local/tmp/diag_%s.log" % a.mode
     extra = (MODES[a.mode] + " " + a.env).strip()
+    cache_env = ("GGML_CDSP_CACHE_MB=%s " % a.cache_mb) if a.cache_mb else ""
 
     if MODES[a.mode] == "__CPU__":
         envs = ("LD_LIBRARY_PATH=%s:/usr/local/lib %s"
@@ -68,14 +96,14 @@ def main():
         envs = ("LD_LIBRARY_PATH=%s:/usr/local/lib "
                 "LD_PRELOAD=%s/libggml_cdsp_preload.so "
                 "GGML_CDSP_BACKEND_PATH=%s/libggml-cdsp.so "
-                "GGML_CDSP_MAX_ELEMS=%s GGML_CDSP_MIN_ELEMS=%s %s %s"
-                % (BIN, BACKEND, BACKEND, a.max_elems, a.min_elems,
+                "GGML_CDSP_MAX_ELEMS=%s GGML_CDSP_MIN_ELEMS=%s %s%s %s"
+                % (BIN, BACKEND, BACKEND, a.max_elems, a.min_elems, cache_env,
                    "" if a.no_debug else "GGML_CDSP_DEBUG=1", extra))
 
     cmd = ("cd %s && %s timeout %d ./llama-cli -m %s -p '%s' "
-           "-n %d -st -c 512 -t 4 --no-warmup%s > %s 2>&1; echo RC=$?; cat %s"
-           % (BIN, envs, a.timeout - 30, MDL, a.prompt.replace("'", "'\\''"),
-              a.tokens, sampling, log, log))
+           "-n %d -st -c 512 -t %d --no-warmup%s > %s 2>&1; echo RC=$?; cat %s"
+           % (BIN, envs, a.timeout - 30, model, a.prompt.replace("'", "'\\''"),
+              a.tokens, a.threads, sampling, log, log))
 
     c = k.connect()
     try:
@@ -116,6 +144,7 @@ def main():
     cache = re.findall(r"cache hits=(\d+) misses=(\d+) bytes=(\d+)", out)
     last_cache = cache[-1] if cache else ("0", "0", "0")
     print("MODE       :", a.mode)
+    print("MODEL      :", model)
     print("OFFLOADS   :", n_off, " ERRORS:", n_err)
     print("CACHE(last): hits=%s misses=%s bytes=%s" % last_cache)
     print("TIMING     :", timing)

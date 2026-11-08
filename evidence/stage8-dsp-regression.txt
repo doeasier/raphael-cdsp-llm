@@ -1,0 +1,101 @@
+[*] connected to device
+[+] put host_test.c
+[+] put host_test_cached.c
+[+] put host_test_batch.c
+[+] put bench_cached.c
+[+] put bench_regbuf.c
+[+] put gen/gemm.h
+[+] put gen/cdsp_gemm_stub.c
+[+] put AEEStdDef.h
+[+] put AEEStdErr.h
+[+] put libgemm_skel.so
+--- compile ---
+
+
+=== host_test (one-shot) 32x128x128 (rc=0) ===
+host: cDSP session open, handle=187650903622976
+host: gemm_int8 done (M=32 N=128 K=128) in 0.48 ms
+host: PASS - all 4096 elements verified correct.
+
+
+=== host_test (one-shot) 64x256x256 (rc=0) ===
+host: cDSP session open, handle=187651376108864
+host: gemm_int8 done (M=64 N=256 K=256) in 1.47 ms
+host: PASS - all 16384 elements verified correct.
+
+
+=== host_test (one-shot) 128x512x512 (rc=0) ===
+host: cDSP session open, handle=187650698655040
+host: gemm_int8 done (M=128 N=512 K=512) in 4.14 ms
+host: PASS - all 65536 elements verified correct.
+
+
+=== host_test_cached (weight-cache) 32x128x128 (rc=0) ===
+host: cDSP session open, handle=187650979886464
+host: gemm_upload done -> weight handle=1 in 0.43 ms
+host: gemm_compute_cached done (M=32 N=128 K=128) in 0.41 ms
+host: PASS - all 4096 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 64x256x256 (rc=0) ===
+host: cDSP session open, handle=187650503865728
+host: gemm_upload done -> weight handle=1 in 0.79 ms
+host: gemm_compute_cached done (M=64 N=256 K=256) in 0.74 ms
+host: PASS - all 16384 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 128x512x512 (rc=0) ===
+host: cDSP session open, handle=187650661549440
+host: gemm_upload done -> weight handle=1 in 1.97 ms
+host: gemm_compute_cached done (M=128 N=512 K=512) in 2.23 ms
+host: PASS - all 65536 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 1x4096x4096 (rc=0) ===
+host: cDSP session open, handle=187650970846592
+host: gemm_upload done -> weight handle=1 in 251.18 ms
+host: gemm_compute_cached done (M=1 N=4096 K=4096) in 7.91 ms
+host: PASS - all 4096 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 1x11008x4096 (rc=0) ===
+host: cDSP session open, handle=187650656212352
+host: gemm_upload done -> weight handle=1 in 678.34 ms
+host: gemm_compute_cached done (M=1 N=11008 K=4096) in 23.93 ms
+host: PASS - all 11008 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_cached (weight-cache) 32x4096x4096 (rc=0) ===
+host: cDSP session open, handle=187651035911552
+host: gemm_upload done -> weight handle=1 in 256.54 ms
+host: gemm_compute_cached done (M=32 N=4096 K=4096) in 95.31 ms
+host: PASS - all 131072 elements verified correct.
+host: gemm_release rc=0
+
+
+=== host_test_batch (Stage 7 batched RPC) ===
+host: uploaded 2 weights -> handles 1 / 2
+host: scalar  2 RPCs = 2.965 ms/pair
+host: batched 1 RPC  = 1.948 ms/pair  (34.3% less)
+host: BATCH_TEST PASS - 1056 elements verified correct.
+BATCH_TEST PASS
+
+=== bench_cached (Stage 6 HVX throughput) ===
+[warm-up] BENCH M=128 N=512 K=512 iters=200 | upload=1.84 ms | compute=2.3735 ms/call | 28.27 GMAC/s | verify[0,511]=PASS
+BENCH M=1 N=32 K=4 iters=100 | upload=0.71 ms | compute=0.5251 ms/call | 0.00 GMAC/s | verify[0,31]=PASS
+BENCH M=1 N=32 K=2560 iters=100 | upload=0.80 ms | compute=0.3248 ms/call | 0.50 GMAC/s | verify[0,31]=PASS
+BENCH M=1 N=1024 K=2560 iters=60 | upload=47.94 ms | compute=2.2504 ms/call | 2.33 GMAC/s | verify[0,1023]=PASS
+BENCH M=1 N=4096 K=4096 iters=25 | upload=252.05 ms | compute=9.1667 ms/call | 3.66 GMAC/s | verify[0,4095]=PASS
+BENCH M=128 N=512 K=512 iters=30 | upload=1.85 ms | compute=2.7972 ms/call | 23.99 GMAC/s | verify[0,511]=PASS
+BENCH M=32 N=4096 K=4096 iters=12 | upload=245.02 ms | compute=93.6356 ms/call | 11.47 GMAC/s | verify[0,4095]=PASS
+
+=== bench_regbuf (Stage 8 RPC buffer strategies) ===
+REGBUF mode=0 HEAP   |   1.0173 ms/call |   +0.0% vs HEAP | verify=PASS
+REGBUF mode=1 RPCMEM |   1.0334 ms/call |   +1.6% vs HEAP | verify=PASS
+REGBUF mode=2 MAPPED  | MMAP_UNSUPPORTED rcA=20 rcC=20 (fdA=11 fdC=12)
+REGBUF_TEST PASS

@@ -198,7 +198,9 @@ dataflow (TCM-resident tiles or batched RPC), not more unrolling.
   `GGML_CDSP_HOST_F32` (exact host F32 GEMM using the same dequant helpers,
   bypassing int8/DSP/cache — used to prove the layout path was clean),
   `GGML_CDSP_BATCH` (Stage 7: merge the split's independent MUL_MATs into one
-  RPC) and `GGML_CDSP_SPLIT_STATS` (dump a MUL_MAT-per-split histogram).
+  RPC), `GGML_CDSP_SPLIT_STATS` (dump a MUL_MAT-per-split histogram) and
+  `GGML_CDSP_PROFILE` (Stage 8: four-stage timing breakdown printed at `.so`
+  unload — weight/cache, activation quantization, FastRPC, output rescale).
 - **llama.cpp 0.9.0 registration.** The device build has `GGML_BACKEND_DL=OFF`,
   so the CPU backend is statically registered and `llama_backend_init()` never
   calls `ggml_backend_load_all()`; `GGML_BACKEND_PATH` is therefore ignored.
@@ -230,6 +232,25 @@ dataflow (TCM-resident tiles or batched RPC), not more unrolling.
   `cdsp_gemm_compute_cached(A, handle)`; the DSP reuses the already-prepacked
   weight. On eviction (capacity exceeded) the handle is released on the DSP,
   freeing its prepacked buffer. `cdsp_backend_free()` releases all handles.
+- **Stage 8: where the time goes (SmolLM2-135M).** With all weights resident
+  in the cache (42 MB, 1984 hits / 31 misses, zero thrash) the backend still
+  reaches only 29% of CPU tokens/s. `GGML_CDSP_PROFILE=1` over 1040 offloaded
+  MUL_MATs: 1.871 ms/op total, of which **FastRPC + DSP GEMM is 1.113 ms
+  (59.5%)**, cold weight uploads 36.5% (one-off), activation quantization
+  3.2%, output rescale 0.8%. Steady state ~1.19 ms/op ≈ 19.3 ms/token, while
+  generation takes 43.3 ms/token — the remaining **~24 ms/token is the
+  CPU↔ACCEL scheduler split synchronization**, outside `cdsp_mul_mat()`.
+  Loading the backend with zero offloads still gives 71 t/s vs CPU 80.6 t/s,
+  so this is not registration cost. All 2015 splits contain exactly **one**
+  MUL_MAT on this model (vs 37.5% multi-matmul splits on Qwen3.5-4B), because
+  RMSNorm/RoPE/softmax/SiLU stay on the CPU and force a split between every
+  pair of matmuls. Consequently split-level batching cannot help here; the
+  expensive unit is the **split boundary**. Persistent zero-copy was also
+  ruled out: `fastrpc_mmap()` → `AEE_EUNSUPPORTED (0x14)` with kernel
+  `mem mmap error`, and `rpcmem_alloc_def` A/C buffers are slower than plain
+  `malloc` (`src/host/bench_regbuf.c`). See
+  [next-steps.md §5](next-steps.md) and
+  [llama-integration.md §4.2](llama-integration.md).
 - `cdsp_gemm_host.cpp` wraps the FastRPC session: `enable_unsigned_pd()`,
   `cdsp_gemm_open(URI "&_dom=cdsp")`, the compute/upload/cached/release calls,
   plus `cdsp_gemm_compute_multi()` (Stage 7, a thin forwarder that reuses the
@@ -253,3 +274,5 @@ The whole plugin is pinned to the **ggml 0.9.0** ABI via a verbatim copy of
 | 6b | on-device `gcc` | `bench_cached` | `/data/local/tmp/cdsp_gemm` | GMAC/s table, `verify=PASS` |
 | 6c | on-device `g++` / `gcc` | `test_q4k`, `libggml_cdsp_preload.so` | `GGML_BACKEND_DIR` | `Q4K_TEST PASS`, backend loads in `llama-cli` |
 | 6d | (none) | `llama_diag.py` | USB-NCM | `Qwen3.5-4B` coherent output, tokens/s |
+| 7 | Windows + Hexagon SDK | skel with batched compute + `host_test_batch` | all 3 skel paths | `BATCH_TEST PASS`, `[cdsp-batch]` counters |
+| 8 | on-device `gcc` / `g++` | `bench_regbuf`, `libggml-cdsp.so` (PROFILE) + `smollm2-135m-q4_k_m.gguf` | `/data/local/tmp/cdsp_gemm`, ggml-backend, `/root/models` | `REGBUF_TEST PASS`, `[cdsp-prof]`, CPU vs cDSP tokens/s |

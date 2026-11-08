@@ -1,0 +1,14 @@
+MODE       : cpu
+MODEL      : /root/models/smollm2-135m-q4_k_m.gguf
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 122.3 t/s | Generation: 79.0 t/s 
+--- OUTPUT ---
+> Once upon a time in a small village
+The first time I saw the picture of the woman in the
+picture, I was in the middle of a long day at work. I was
+working on a project that was going to be a big deal. I was
+working
+[ Prompt: 122.3 t/s | Generation: 79.0 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_cpu.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_cpu.host.log

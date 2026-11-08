@@ -1,0 +1,13 @@
+MODE       : normal
+MODEL      : /root/models/smollm2-135m-q4_k_m.gguf
+OFFLOADS   : 0  ERRORS: 0
+CACHE(last): hits=0 misses=0 bytes=0
+TIMING     : 56.4 t/s | Generation: 24.7 t/s 
+--- OUTPUT ---
+> Once upon a time in a small village
+The first time I saw the picture of the
+The second time I saw the picture of the
+The
+[ Prompt: 56.4 t/s | Generation: 24.7 t/s ]
+Exiting...
+--- device log: /data/local/tmp/diag_normal.log  host copy: F:\work\WorkBuddy\raphael-cdsp-llm\tmp\diag_normal.host.log
