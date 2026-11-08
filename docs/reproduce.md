@@ -398,13 +398,18 @@ Stages 0–8 are implemented and verified. Batched RPC (§4 of next-steps.md) is
 **done** — 21.6% lower RPC-pair latency but no end-to-end win. The small-model
 benchmark (§5) is also **done**: SmolLM2-135M keeps all weights in the cache
 (42 MB, zero thrash) yet reaches only 29% of CPU tokens/s, falsifying the
-cache-residency hypothesis. Remaining work, in priority order:
+cache-residency hypothesis. **Stage 9** then assessed the last architectural
+lever without implementing it (source analysis only, no device changes):
+[`whole-layer-fusion-feasibility.md`](whole-layer-fusion-feasibility.md).
 
-- **Remove split boundaries, not RPCs.** ~24 ms/token is spent in CPU↔ACCEL
-  scheduler synchronization on the 135M model. Getting several consecutive
-  matmuls into one split requires DSP implementations of RMSNorm/RoPE/SiLU/
-  softmax or a fused whole-layer FastRPC call — an architectural change, not
-  another backend tweak.
+- **Remove split boundaries, not RPCs — CLOSED (assessed, not worth doing).**
+  ~24 ms/token is spent in CPU↔ACCEL scheduler synchronization on the 135M
+  model. ggml 0.9.0 would merge the graph into one split as soon as
+  `supports_op()` covers the whole op chain (no scheduler patch needed), but
+  even with that overhead at zero the ceiling is **51.8 t/s = 64% of CPU**.
+  V66 has no HMX and no portable upstream `ggml-hexagon` skel (v73+ only), so
+  the ~46,600-line fused implementation would have to be written from scratch.
+  See the assessment for the derivation and ranked alternatives.
 - **Weight staging for large models.** The 256 MB cache cannot hold a 4B model
   as int8, so the large FFN GEMMs stay on the CPU. Streaming tiles from AP
   memory is the next structural step.

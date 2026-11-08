@@ -5,8 +5,13 @@ Stages 0–5 implemented and verified the transport path. **Stage 6** closed
 former top priority, batched RPC (§4) — with a deliberately honest negative
 end-to-end result. **Stage 8** ran the small-model benchmark (§5) and
 **falsified the cache-residency hypothesis**: even a model whose int8 weights
-fit entirely in the cDSP cache is ~3.4× slower than the CPU. Everything below
-records the measurements and what remains.
+fit entirely in the cDSP cache is ~3.4× slower than the CPU. **Stage 9** closed
+the former top priority (§6 item 1) with a source-level feasibility assessment
+of whole-layer DSP fusion — **assessed, deliberately not implemented**: see
+[`docs/whole-layer-fusion-feasibility.md`](whole-layer-fusion-feasibility.md).
+Verdict: the mechanism works but the ceiling is only ~64% of CPU, so the
+performance thread is closed. Everything below records the measurements and
+what remains.
 
 ---
 
@@ -286,11 +291,21 @@ is the wrong granularity.
 
 ## 6. What remains (in priority order)
 
-1. **Remove split boundaries, not RPCs.** The only lever that touches the
-   ~24 ms/token scheduler overhead is getting several consecutive matmuls into
-   one ACCEL split — e.g. implementing RMSNorm/RoPE/SiLU/softmax as DSP kernels,
-   or fusing a whole transformer layer into one FastRPC call. This is a much
-   larger change than a backend plugin and is the honest "next project".
+1. **Remove split boundaries, not RPCs — CLOSED by Stage 9 (assessed, NOT
+   implemented).** This was the former top priority. Source analysis of
+   `ggml-backend.cpp` shows ggml 0.9.0 would merge the whole graph into one
+   ACCEL split as soon as `supports_op()` covers the op chain — no scheduler
+   patch needed — but the DSP would then have to execute RMSNorm/RoPE/SiLU/
+   softmax/KV updates itself (~46.6k upstream-equivalent lines, new IDL, V66
+   has no HMX or portable upstream skel). Decisively, removing **all** ~24
+   ms/token of split overhead yields only `19.3 ms/token = 51.8 t/s`, **64% of
+   CPU's 81.2 t/s**; parity additionally needs the DSP GEMM ~1.6× faster,
+   which the `M=1` 1 byte/MAC roofline (§2.2) rules out. Full evidence and
+   ranked alternatives:
+   [`docs/whole-layer-fusion-feasibility.md`](whole-layer-fusion-feasibility.md).
+   A zero-DSP-cost falsification experiment (widen `supports_op()`, keep the
+   math on the host) is proposed there if the ~24 ms attribution ever needs
+   to be re-checked.
 2. **Weight staging / TCM residency for large models** (§1.1): keep packed
    weights on the AP, stream tiles to the DSP, amortize per tile rather than
    per layer. Needed before 4B FFN matrices can be offloaded.
@@ -302,9 +317,12 @@ is the wrong granularity.
    M=1 decode remains 1 byte/MAC memory-bound, see §2.2.
 
 > **Scope note.** Stages 6–8 establish a consistent, measured negative result
-> for *single-operator offload* at 135M and 4B model scales. Further tuning of
-> the current backend is unlikely to beat the CPU; the remaining items above
-> are architectural, not incremental.
+> for *single-operator offload* at 135M and 4B model scales; Stage 9 closes the
+> only architectural lever that could have changed it. Further tuning of the
+> current backend is unlikely to beat the CPU. Items 2–5 are correctness,
+> alternative-workload or hardware-generation topics, not a performance plan
+> for this backend — the recommended directions are ranked in
+> [`docs/whole-layer-fusion-feasibility.md` §7](whole-layer-fusion-feasibility.md).
 
 ---
 

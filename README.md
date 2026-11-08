@@ -24,6 +24,7 @@ eXtensions).
 | 6 | HVX peak tuning + real llama.cpp inference | 3-path kernel (up to **32.2 GMAC/s**); `Qwen3.5-4B-Q4_K_M` runs end-to-end with coherent output at ~94% of CPU tokens/s |
 | 7 | Batched RPC: one FastRPC call per scheduler split | `BATCH_TEST PASS` (1056 elements); **−21.6% RPC latency**, 78–198 round-trips removed per run. End-to-end tokens/s unchanged — see §4.1 |
 | 8 | Small-model benchmark: does cache residency let cDSP beat CPU? | **No.** `SmolLM2-135M` weights fit entirely (42 MB, zero thrash) yet cDSP is only **29% of CPU**; quantified with `GGML_CDSP_PROFILE`, split stats and a zero-copy feasibility probe |
+| 9 | Whole-layer DSP fusion feasibility (assessment only, **no code/device changes**) | **Not worth it.** ggml 0.9.0 would merge the graph into one ACCEL split without a scheduler patch, but the ceiling is **~51.8 t/s = 64% of CPU** even with zero split overhead; V66 has no HMX/portable upstream skel. See [`docs/whole-layer-fusion-feasibility.md`](docs/whole-layer-fusion-feasibility.md) |
 
 **Measured results (K20 Pro cDSP, HVX):**
 
@@ -120,6 +121,27 @@ diverges from CPU after ~10 tokens due to narrow logit margins. Details:
 [docs/next-steps.md §5](docs/next-steps.md),
 [docs/llama-integration.md §4.2](docs/llama-integration.md), `evidence/stage8-*`.
 
+**Stage 9 — whole-layer DSP fusion, feasibility assessment only:**
+
+The ~24 ms/token outside the backend pointed at the CPU↔ACCEL split boundary.
+Reading llama.cpp 0.9.0's `ggml_backend_sched_split_graph()` shows that no
+scheduler patch is needed: widening `supports_op()` to the full op chain would
+merge the graph into one ACCEL split (both backends already share the CPU buffer
+type, so no tensor copies are inserted). But the DSP would then have to execute
+RMSNorm/RoPE/SiLU/softmax and persistent KV state itself — llama.cpp ships
+exactly that as `ggml-hexagon` (~46,600 lines, 40+ DSP kernels) but only for
+**v73–v85**, while Hexagon 690 is **V66**.
+
+The decisive number: removing **all** split overhead leaves 19.3 ms/token =
+**51.8 t/s, still only 64% of CPU's 81.2 t/s**. Parity would additionally need
+the DSP GEMM ~1.6× faster, which the `M=1` 1 byte/MAC roofline rules out.
+**The performance thread is closed**; the backend is frozen as a verified,
+reproducible negative result. Ranked alternatives (compute-bound prefill/batch
+workloads, power/CPU-offload metrics, newer hardware) and the source evidence
+are in [`docs/whole-layer-fusion-feasibility.md`](docs/whole-layer-fusion-feasibility.md)
+and [`evidence/stage9-scheduler-excerpts.txt`](evidence/stage9-scheduler-excerpts.txt).
+No `src/` file, skel, device state or service was changed.
+
 ---
 
 ## Architecture
@@ -181,7 +203,8 @@ flowchart LR
     A25["Stage 2.5<br/>test_sched<br/>scheduler offload<br/>SCHED_TEST PASS"] --> A5
     A5["Stage 5<br/>weight-cache RPC<br/>upload once, reuse handle<br/>CACHE_TEST PASS"] --> A6
     A6["Stage 6<br/>3-path HVX kernel +<br/>LD_PRELOAD shim +<br/>real llama.cpp inference<br/>32.2 GMAC/s, coherent output"] --> A7
-    A7["Stage 7<br/>batched RPC per split<br/>BATCH_TEST PASS<br/>−21.6% RPC latency"] --> A8["Stage 8<br/>small-model benchmark<br/>42 MB cache, zero thrash<br/>still only 29% of CPU"] --> NX["Next:<br/>fuse a whole layer<br/>into one split<br/>(architectural)"]
+    A7["Stage 7<br/>batched RPC per split<br/>BATCH_TEST PASS<br/>−21.6% RPC latency"] --> A8["Stage 8<br/>small-model benchmark<br/>42 MB cache, zero thrash<br/>still only 29% of CPU"] --> A9["Stage 9<br/>whole-layer fusion<br/>feasibility assessment only<br/>ceiling 64% of CPU"]
+    A9 --> DONE["Verdict: performance<br/>thread closed<br/>frozen negative result"]
 ```
 
 See [docs/reproduce.md](docs/reproduce.md) for the exact commands.
@@ -236,12 +259,14 @@ raphael-cdsp-llm/
 │   ├── stage7-*.txt          # Stage 7 regression (10/10 + 5/5 PASS)
 │   ├── stage7-ab/            # deterministic A/B logs (thermal-bias analysis)
 │   ├── stage8-*-regression.txt# Stage 8 regression (21/21 + 5/5 PASS, REGBUF_TEST)
-│   └── stage8/               # small-model CPU/cDSP correctness + timing logs
+│   ├── stage8/               # small-model CPU/cDSP correctness + timing logs
+│   └── stage9-scheduler-excerpts.txt  # ggml 0.9.0 split logic, exact line refs
 └── docs/
     ├── architecture.md        # detailed architecture + HVX kernel notes
     ├── reproduce.md           # step-by-step reproduction
     ├── llama-integration.md   # llama-cli recipe, env vars, batch A/B, troubleshooting
-    └── next-steps.md          # Stage 5/6/7/8 results, roofline, remaining work
+    ├── next-steps.md          # Stage 5/6/7/8 results, roofline, remaining work
+    └── whole-layer-fusion-feasibility.md  # Stage 9 assessment + ranked alternatives
 ```
 
 ---

@@ -1,4 +1,4 @@
-# Verification evidence (Stage 6 + Stage 7 + Stage 8)
+# Verification evidence (Stage 6 + Stage 7 + Stage 8 + Stage 9)
 
 Raw output captured on the Redmi K20 Pro over USB-NCM. Stage 7/8 use the
 final `libgemm_skel.so` (three-path HVX kernel **plus batched compute**, md5
@@ -14,6 +14,16 @@ final `libgemm_skel.so` (three-path HVX kernel **plus batched compute**, md5
 | `stage8-dsp-regression.txt` | `python3 scripts/device/deploy_cdsp_gemm.py` (Stage 8 build) | **21 PASS, no failures** — now also builds `bench_regbuf` and prints `REGBUF_TEST PASS` |
 | `stage8-ggml-regression.txt` | `python3 scripts/device/deploy_ggml_cdsp.py` | **5/5 PASS** with the `GGML_CDSP_PROFILE` backend, all previous tests still green |
 | `stage8/` | `llama_diag.py --model smollm2-135m-q4_k_m.gguf` | small-model CPU/cDSP timing, greedy + sampled correctness, PROFILE/SPLIT_STATS logs |
+| `stage9-scheduler-excerpts.txt` | read-only SSH source inspection (no `llama-cli` run) | ggml 0.9.0 split-scheduler excerpts with exact line numbers, op inventory and upstream `ggml-hexagon` code-volume measurement |
+
+## Stage 9 — assessment only
+
+Stage 9 produced **no runtime logs on purpose**: it is a source-level
+feasibility study (task #74), and the only artefact is the annotated excerpt
+file above plus
+[`docs/whole-layer-fusion-feasibility.md`](../docs/whole-layer-fusion-feasibility.md).
+All performance numbers quoted in that document come from the Stage 8 logs
+already indexed here; no device state, kernel, skel or `src/` file changed.
 
 ## Stage 6 canonical HVX numbers
 

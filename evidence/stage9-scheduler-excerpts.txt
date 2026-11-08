@@ -1,0 +1,194 @@
+# Stage 9 source evidence — ggml 0.9.0 scheduler split logic
+# Captured 2026-11-08, read-only. No device state changed, no code changed.
+#
+# Device : Redmi K20 Pro (raphael), Ubuntu rootfs, 7.0.0-sm8150-gc526b7bf7ebc
+# Via    : USB-NCM 172.16.42.1, scripts/device/k20_ssh.py
+# Source : /root/llama.cpp-0.9.0/ggml/src/ggml-backend.cpp   (2,897 lines)
+#          /root/llama.cpp-0.9.0/ggml/src/ggml-backend-impl.h (300 lines)
+#          /root/llama.cpp-0.9.0/src/llama-graph.cpp
+#          /root/llama.cpp-0.9.0/ggml/src/ggml-hexagon/*      (upstream HTP backend)
+# Local analysis copies (gitignored): tmp/ggml-backend-0.9.0.cpp, tmp/hex/*
+#
+# Line numbers below refer to the unmodified llama.cpp 0.9.0 source above.
+
+===============================================================================
+[E1] PASS 1 — weight-driven backend assignment
+     ggml-backend.cpp:1359-1392, ggml_backend_sched_backend_id_from_cur()
+===============================================================================
+    // operations with weights are preferably run on the same backend as the weights
+    bool allow = true;
+    allow = allow && tensor->op != GGML_OP_ROPE;              // L1364
+    ...
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = tensor->src[i];
+        if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+            ...
+            SET_CAUSE(tensor, "1.wgt%d", i);
+            return src_backend_id;                            // L1387  <-- hard assignment
+        }
+    }
+
+  ggml_backend_sched_backend_from_buffer() at L1296-1316 returns the FIRST
+  backend for which (supports_buft(buffer->buft) && supports_op(op)).
+  Our cDSP backend is backend[0] and supports_buft() accepts all host buffers,
+  so a MUL_MAT is assigned to cDSP here; RMS_NORM / SILU / SOFT_MAX / ADD
+  (supports_op == false) fall through to the CPU backend, which is the LAST
+  backend. Pass 2 only fills nodes still == -1, so this assignment is final.
+
+===============================================================================
+[E2] PASS 2 — expansion only fills unassigned nodes, and only if supported
+     ggml-backend.cpp:1466-1471, 1532-1610
+===============================================================================
+static void ggml_backend_sched_set_if_supported(..., int cur_backend_id, int * node_backend_id) {
+    if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {   // L1467
+        *node_backend_id = cur_backend_id;
+    }
+}
+    // expand gpu down (L1538-1557) / up (L1559-1578):
+    if (*node_backend_id == sched->n_backends - 1) cur_backend_id = -1;  // skip CPU
+    ...
+    } else if (cur_backend_id != -1) {
+        ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
+    }
+
+  Consequence: making cdsp_dev_supports_op() return true for the full op chain
+  would let pass 1/2/3 assign the entire graph to cDSP with NO ggml patch.
+
+===============================================================================
+[E3] PASS 3 — upgrade is live because both backends use the same buffer type
+     ggml-backend.cpp:1650-1669
+===============================================================================
+        for (int b = 0; b < *node_backend_id; b++) {
+            if (sched->bufts[b] == sched->bufts[*node_backend_id] &&
+                ggml_backend_supports_op(sched->backends[b], node)) { ... }
+
+  src/ggml-backend/ggml-cdsp.cpp:859-865 returns
+  ggml_backend_cpu_buffer_type() for BOTH get_buffer_type and
+  get_host_buffer_type, so sched->bufts[cDSP] == sched->bufts[CPU].
+
+===============================================================================
+[E4] PASS 5 — THE SPLIT BOUNDARY
+     ggml-backend.cpp:1732-1770
+===============================================================================
+            bool need_new_split = false;
+            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                ... if (src_backend_id != cur_backend_id &&
+                        !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        need_new_split = true;                    // L1745
+            }
+
+            if (node_backend_id != cur_backend_id || need_new_split) {   // L1752
+                split->i_end = i;
+                i_split++;
+                split->backend_id = node_backend_id;
+                split->i_start = i;
+                cur_backend_id = node_backend_id;
+            }
+
+  Stage 8 measured 2,015 splits / 2,015 MUL_MAT nodes: every non-MUL_MAT op
+  creates one CPU<->ACCEL boundary here. There is no cost-based merge heuristic
+  in this scheduler; adjacency of backend IDs is the ONLY merge rule.
+
+[E5] PASS 5 — cross-split tensor copies are NOT the cost on this backend
+     ggml-backend.cpp:1783-1804
+===============================================================================
+            if (src_backend_id != cur_backend_id &&
+                !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                ... create tensor_id_copy(...) / split->inputs[n_inputs] = src;
+                node->src[j] = tensor_id_copy(...);
+            }
+
+  cdsp_dev_supports_buft() (ggml-cdsp.cpp:873-875) is
+  `ggml_backend_buft_is_host(buft)`; all weights/activations are host buffers,
+  so buffer_supported() is true and NO copy is inserted. The ~24 ms/token of
+  Stage 8 is scheduler/graph setup + synchronous backend execution, not DMA.
+
+===============================================================================
+[E6] EXECUTION — one graph_compute_async + one sync per split
+     ggml-backend.cpp:2125-2204
+===============================================================================
+        if (split->n_inputs == 0 && prev_backend_id >= 0 &&
+            prev_backend_id != split_backend_id) {
+            ggml_backend_synchronize(sched->backends[prev_backend_id]);   // L2142
+        }
+        ...
+        enum ggml_status ec = ggml_backend_graph_compute_async(split_backend,
+                                                               &split->graph); // L2160
+        ...
+        prev_backend_id = split_backend_id;                                // L2203
+
+  Our device reports caps.async=false / events=false / mmap_support=false
+  (ggml-cdsp.cpp:850-856) and synchronize() is a no-op because
+  cdsp_graph_compute() is fully synchronous (L702, L704-801). Every split is
+  therefore a serial CPU -> FastRPC round trip -> CPU handoff.
+
+  cdsp_graph_compute() L792-800 currently SKIPS every non-MUL_MAT node:
+        // any other op type is handled by the CPU backend (scheduler does not
+        // assign it to us because supports_op() returns false for it)
+  If supports_op() were widened without implementing those ops, the DSP would
+  silently leave their dst tensors unwritten -> silent numerical corruption.
+
+===============================================================================
+[E7] OP INVENTORY for a llama transformer layer
+     /root/llama.cpp-0.9.0/src/llama-graph.cpp (grep of ggml_* constructors)
+===============================================================================
+  ggml_mul_mat 15, ggml_add 27, ggml_mul 20, ggml_scale 18,
+  ggml_reshape_3d 14, ggml_get_rows 13, ggml_cont 13, ggml_clamp 10,
+  ggml_view_2d 9, ggml_reshape_2d 9, ggml_view_4d 7, ggml_permute 7,
+  ggml_view_1d 6, ggml_view_3d 5, ggml_set_rows 5, ggml_reshape_4d 5,
+  ggml_pad 5, ggml_transpose 4, ggml_silu 4, ggml_relu 4, ggml_mul_mat_id 4,
+  ggml_div 4, ggml_cast 4, ggml_tanh 3, ggml_soft_max 3, ggml_sigmoid 3,
+  ggml_rms_norm (L1799, L2581), ggml_swiglu* / geglu* (L2047-2136, L2473-2524),
+  ggml_soft_max_ext (L3103).
+  RoPE is NOT called from llama-graph.cpp in 0.9.0: the arch-specific models
+  call ggml_rope_ext, e.g. models/llama.cpp:146 (Qcur) and :152 (Kcur);
+  293 ggml_rope_ext call sites exist under models/*.cpp.
+  NOTE: view/reshape/permute ops are skipped by the split loop (L1542 etc.),
+  so they can remain host-side, but their strides must be resolved on the DSP.
+
+  llama-graph.cpp:3280-3285 — upstream already fights split count by graph
+  ordering, and fuses RoPE into the KV cache:
+        // these nodes are added to the graph together so that they are not
+        // reordered / by doing so, the number of splits in the graph is reduced
+        // expand k later to enable rope fusion which directly writes into k-v cache
+        ggml_build_forward_expand(gf, q_cur);
+        ggml_build_forward_expand(gf, v_cur);
+        ggml_build_forward_expand(gf, k_cur);
+  A DSP-fused layer would therefore also need to reproduce the in-place KV
+  write semantics of this optimisation, not just standalone RoPE math.
+
+===============================================================================
+[E8] UPSTREAM FUSED BACKEND EXISTS, BUT NOT FOR V66
+     /root/llama.cpp-0.9.0/ggml/src/ggml-hexagon/
+===============================================================================
+  ggml/CMakeLists.txt:274      option(GGML_HEXAGON ... OFF)
+  build/CMakeCache.txt         GGML_HEXAGON:BOOL=OFF     (device build)
+
+  ggml-hexagon/CMakeLists.txt:93-97
+        build_htp_skel(v73); (v75); (v79); (v81); (v85);
+  ggml-hexagon/CMakeLists.txt:4-6   requires HEXAGON_SDK_ROOT (FATAL otherwise)
+  ggml-hexagon/CMakeLists.txt:28    HTP cert / skel signing
+  ggml-hexagon/ggml-hexagon.cpp:3430-3434
+        "failed to query HTP version ... defaulting to v73"
+        "Hexagon arch v%d is under supported range, capping at v73"
+  ggml-hexagon/ggml-hexagon.cpp:87   opt_nhmx = 1 (HMX enabled)
+  ggml-hexagon/htp/CMakeLists.txt    hmx-queue.c, matmul-ops.c, rope-ops.c,
+                                     softmax-ops.c, glu-ops.c, flash-attn-ops.c
+                                     ...
+  ggml-hexagon/htp-fusion.cpp        649 lines of fusion rules
+  ggml-hexagon/htp-kparams.cpp     5,287 lines
+  ggml-hexagon/htp-repack.cpp      1,636 lines
+
+  Measured code volume (device, `cat *.c | wc -l` etc.):
+        host side  ggml-hexagon/*.cpp + *.h        12,785 lines
+        DSP side   ggml-hexagon/htp/*.c            33,800 lines
+        ours       src/dsp/gemm_dsp.c                516 lines
+                   src/ggml-backend/ggml-cdsp.cpp    946 lines
+                   src/ggml-backend/cdsp_gemm_host.cpp 122 lines
+                   src/gen/* (QAIC generated)      1,266 lines
+
+  Hexagon 690 (SM8150) is V66: docs/05-Hexagon690-DSP调用研究.md §1 and the
+  GET_DSP_INFO attr=6 value 0x00018466 (low byte 0x66). HMX/HTP skels start
+  at V68; upstream builds nothing below V73. The official fused backend is
+  therefore NOT portable to this SoC.
